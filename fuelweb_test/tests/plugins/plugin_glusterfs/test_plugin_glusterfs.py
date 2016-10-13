@@ -17,13 +17,12 @@ from proboscis.asserts import assert_equal
 from proboscis.asserts import assert_true
 from proboscis import test
 
+from fuelweb_test.helpers.checkers import check_plugin_path_env
 from fuelweb_test.helpers.decorators import log_snapshot_after_test
-from fuelweb_test.helpers import checkers
+from fuelweb_test.helpers import utils
 from fuelweb_test.settings import DEPLOYMENT_MODE
 from fuelweb_test.settings import GLUSTER_CLUSTER_ENDPOINT
 from fuelweb_test.settings import GLUSTER_PLUGIN_PATH
-from fuelweb_test.settings import NEUTRON_ENABLE
-from fuelweb_test.settings import NEUTRON_SEGMENT_TYPE
 from fuelweb_test.tests.base_test_case import SetupEnvironment
 from fuelweb_test.tests.base_test_case import TestBasic
 
@@ -31,6 +30,12 @@ from fuelweb_test.tests.base_test_case import TestBasic
 @test(groups=["plugins"])
 class GlusterfsPlugin(TestBasic):
     """GlusterfsPlugin."""  # TODO documentation
+    def __init__(self):
+        super(GlusterfsPlugin, self).__init__()
+        check_plugin_path_env(
+            var_name='GLUSTER_PLUGIN_PATH',
+            plugin_path=GLUSTER_PLUGIN_PATH
+        )
 
     @classmethod
     def check_glusterfs_conf(cls, remote, path, gfs_endpoint):
@@ -68,28 +73,19 @@ class GlusterfsPlugin(TestBasic):
         self.env.revert_snapshot("ready_with_3_slaves")
 
         # copy plugin to the master node
-
-        checkers.upload_tarball(
-            self.env.d_env.get_admin_remote(), GLUSTER_PLUGIN_PATH, '/var')
+        utils.upload_tarball(
+            ip=self.ssh_manager.admin_ip,
+            tar_path=GLUSTER_PLUGIN_PATH,
+            tar_target='/var')
 
         # install plugin
-
-        checkers.install_plugin_check_code(
-            self.env.d_env.get_admin_remote(),
+        utils.install_plugin_check_code(
+            ip=self.ssh_manager.admin_ip,
             plugin=os.path.basename(GLUSTER_PLUGIN_PATH))
-
-        settings = None
-
-        if NEUTRON_ENABLE:
-            settings = {
-                "net_provider": 'neutron',
-                "net_segment_type": NEUTRON_SEGMENT_TYPE
-            }
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
             mode=DEPLOYMENT_MODE,
-            settings=settings
         )
 
         plugin_name = 'external_glusterfs'
@@ -113,10 +109,11 @@ class GlusterfsPlugin(TestBasic):
 
         for node in ('slave-01', 'slave-03'):
             _ip = self.fuel_web.get_nailgun_node_by_name(node)['ip']
-            self.check_glusterfs_conf(
-                remote=self.env.d_env.get_ssh_to_remote(_ip),
-                path='/etc/cinder/glusterfs',
-                gfs_endpoint=GLUSTER_CLUSTER_ENDPOINT)
+            with self.env.d_env.get_ssh_to_remote(_ip) as remote:
+                self.check_glusterfs_conf(
+                    remote=remote,
+                    path='/etc/cinder/glusterfs',
+                    gfs_endpoint=GLUSTER_CLUSTER_ENDPOINT)
 
         self.fuel_web.verify_network(cluster_id)
 
@@ -148,34 +145,26 @@ class GlusterfsPlugin(TestBasic):
             14. Run ostf
 
         Duration 50m
-        Snapshot deploy_glasterfs_ha
+        Snapshot deploy_glusterfs_ha
 
         """
         self.env.revert_snapshot("ready_with_5_slaves")
 
         # copy plugin to the master node
-
-        checkers.upload_tarball(
-            self.env.d_env.get_admin_remote(), GLUSTER_PLUGIN_PATH, '/var')
+        utils.upload_tarball(
+            ip=self.ssh_manager.admin_ip,
+            tar_path=GLUSTER_PLUGIN_PATH,
+            tar_target='/var')
 
         # install plugin
 
-        checkers.install_plugin_check_code(
-            self.env.d_env.get_admin_remote(),
+        utils.install_plugin_check_code(
+            ip=self.ssh_manager.admin_ip,
             plugin=os.path.basename(GLUSTER_PLUGIN_PATH))
-
-        settings = None
-
-        if NEUTRON_ENABLE:
-            settings = {
-                "net_provider": 'neutron',
-                "net_segment_type": NEUTRON_SEGMENT_TYPE
-            }
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
             mode=DEPLOYMENT_MODE,
-            settings=settings
         )
 
         plugin_name = 'external_glusterfs'
@@ -198,10 +187,11 @@ class GlusterfsPlugin(TestBasic):
         self.fuel_web.deploy_cluster_wait(cluster_id)
 
         _ip = self.fuel_web.get_nailgun_node_by_name("slave-03")['ip']
-        self.check_glusterfs_conf(
-            remote=self.env.d_env.get_ssh_to_remote(_ip),
-            path='/etc/cinder/glusterfs',
-            gfs_endpoint=GLUSTER_CLUSTER_ENDPOINT)
+        with self.env.d_env.get_ssh_to_remote(_ip) as remote:
+            self.check_glusterfs_conf(
+                remote=remote,
+                path='/etc/cinder/glusterfs',
+                gfs_endpoint=GLUSTER_CLUSTER_ENDPOINT)
 
         self.fuel_web.verify_network(cluster_id)
 
@@ -220,10 +210,11 @@ class GlusterfsPlugin(TestBasic):
 
         for node in ('slave-03', 'slave-04', 'slave-05'):
             _ip = self.fuel_web.get_nailgun_node_by_name(node)['ip']
-            self.check_glusterfs_conf(
-                remote=self.env.d_env.get_ssh_to_remote(_ip),
-                path='/etc/cinder/glusterfs',
-                gfs_endpoint=GLUSTER_CLUSTER_ENDPOINT)
+            with self.env.d_env.get_ssh_to_remote(_ip) as remote:
+                self.check_glusterfs_conf(
+                    remote=remote,
+                    path='/etc/cinder/glusterfs',
+                    gfs_endpoint=GLUSTER_CLUSTER_ENDPOINT)
 
         self.fuel_web.run_ostf(
             cluster_id=cluster_id)

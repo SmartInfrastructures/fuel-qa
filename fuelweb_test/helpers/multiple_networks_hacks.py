@@ -19,66 +19,65 @@
 # This code should be removed from tests as soon as automatic cobbler
 # configuring for non-default admin (PXE) networks is implemented in Fuel
 
-from ipaddr import IPNetwork
 from proboscis.asserts import assert_equal
 
-from fuelweb_test import settings
-from fuelweb_test import logwrap
+from core.helpers.log_helpers import logwrap
+
+from fuelweb_test.helpers.ssh_manager import SSHManager
 
 
 @logwrap
-def configure_second_admin_cobbler(self):
-    dhcp_template = '/etc/cobbler/dnsmasq.template'
-    remote = self.d_env.get_admin_remote()
-    admin_net2 = self.d_env.admin_net2
-    second_admin_if = settings.INTERFACES.get(admin_net2)
-    second_admin_ip = str(
-        self.d_env.nodes().admin.get_ip_address_by_network_name(admin_net2))
-
-    admin_net2_object = self.d_env.get_network(name=admin_net2)
-    second_admin_network = admin_net2_object.ip.ip
-    second_admin_netmask = admin_net2_object.ip.netmask
-    network = IPNetwork('{0}/{1}'.format(second_admin_network,
-                                         second_admin_netmask))
-    discovery_subnet = [net for net in network.iter_subnets(1)][-1]
-    first_discovery_address = str(discovery_subnet.network)
-    last_discovery_address = str(discovery_subnet.broadcast - 1)
-    new_range = ('interface={4}\\n'
-                 'dhcp-range=internal2,{0},{1},{2}\\n'
-                 'dhcp-option=net:internal2,option:router,{3}\\n'
-                 'pxe-service=net:internal2,x86PC,"Install",pxelinux,{3}\\n'
-                 'dhcp-boot=net:internal2,pxelinux.0,boothost,{3}\\n').\
-        format(first_discovery_address, last_discovery_address,
-               second_admin_netmask, second_admin_ip, second_admin_if)
-    cmd = ("dockerctl shell cobbler sed -r '$a \{0}' -i {1};"
-           "dockerctl shell cobbler cobbler sync").format(new_range,
-                                                          dhcp_template)
-    result = remote.execute(cmd)
-    assert_equal(result['exit_code'], 0, ('Failed to add second admin'
-                 'network to cobbler: {0}').format(result))
+def configure_second_admin_dhcp(ip, interface):
+    dhcp_conf_file = '/etc/cobbler/dnsmasq.template'
+    cmd = ("sed '0,/^interface.*/s//\\0\\ninterface={0}/' -i {1};"
+           "cobbler sync").format(interface,
+                                  dhcp_conf_file)
+    result = SSHManager().execute(
+        ip=ip,
+        cmd=cmd
+    )
+    assert_equal(result['exit_code'], 0, ('Failed to add second admin '
+                 'network to DHCP server: {0}').format(result))
 
 
 @logwrap
-def configure_second_admin_firewall(self, network, netmask):
-    remote = self.d_env.get_admin_remote()
-    # Allow input/forwarding for nodes from the second admin network
+def configure_second_admin_firewall(ip, network, netmask, interface,
+                                    master_ip):
+    # Allow input/forwarding for nodes from the second admin network and
+    # enable source NAT for UDP (tftp) and HTTP (proxy server) traffic
+    # on master node
     rules = [
-        ('-I INPUT -i {0} -m comment --comment "input from 2nd admin network" '
-         '-j ACCEPT').format(settings.INTERFACES.get(self.d_env.admin_net2)),
-        ('-t nat -I POSTROUTING -s {0}/{1} -o eth+ -m comment --comment '
+        ('-I INPUT -i {0} -m comment --comment "input from admin network" '
+         '-j ACCEPT').format(interface),
+        ('-t nat -I POSTROUTING -s {0}/{1} -o e+ -m comment --comment '
          '"004 forward_admin_net2" -j MASQUERADE').
-        format(network, netmask)
+        format(network, netmask),
+        ("-t nat -I POSTROUTING -o {0} -d {1}/{2} -p udp -m addrtype "
+         "--src-type LOCAL -j SNAT --to-source {3}").format(interface,
+                                                            network, netmask,
+                                                            master_ip),
+        ("-t nat -I POSTROUTING -d {0}/{1} -p tcp --dport 8888 -j SNAT "
+         "--to-source {2}").format(network, netmask, master_ip),
+        ('-I FORWARD -i {0} -m comment --comment '
+         '"forward custom admin net" -j ACCEPT').format(interface)
     ]
 
     for rule in rules:
         cmd = 'iptables {0}'.format(rule)
-        result = remote.execute(cmd)
+        result = SSHManager().execute(
+            ip=ip,
+            cmd=cmd
+        )
         assert_equal(result['exit_code'], 0,
-                     ('Failed to add firewall rule for second admin net'
-                      'on master node: {0}, {1}').format(rule, result))
+                     ('Failed to add firewall rule for admin net on'
+                      ' master node: {0}, {1}').format(rule, result))
+
     # Save new firewall configuration
     cmd = 'service iptables save'
-    result = remote.execute(cmd)
+    result = SSHManager().execute(
+        ip=ip,
+        cmd=cmd
+    )
     assert_equal(result['exit_code'], 0,
                  ('Failed to save firewall configuration on master node:'
                   ' {0}').format(result))

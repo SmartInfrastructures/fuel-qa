@@ -23,12 +23,50 @@
 # Copyright Gurock Software GmbH. See license.md for details.
 #
 
+from __future__ import unicode_literals
+
 import base64
-import json
-import urllib2
+import time
+
+import requests
+from requests.exceptions import HTTPError
+from requests.packages.urllib3 import disable_warnings
+
+from fuelweb_test.testrail.settings import logger
 
 
-class APIClient:
+disable_warnings()
+
+
+def request_retry(codes):
+    log_msg = "Got {0} Error! Waiting {1} seconds and trying again..."
+
+    def retry_request(func):
+        def wrapper(*args, **kwargs):
+            iter_number = 0
+            while True:
+                try:
+                    response = func(*args, **kwargs)
+                    response.raise_for_status()
+                except HTTPError as e:
+                    error_code = e.response.status_code
+                    if error_code in codes:
+                        if iter_number < codes[error_code]:
+                            wait = 60
+                            if 'Retry-After' in e.response.headers:
+                                wait = int(e.response.headers['Retry-after'])
+                            logger.debug(log_msg.format(error_code, wait))
+                            time.sleep(wait)
+                            iter_number += 1
+                            continue
+                    raise
+                else:
+                    return response.json()
+        return wrapper
+    return retry_request
+
+
+class APIClient(object):
     """APIClient."""  # TODO documentation
 
     def __init__(self, base_url):
@@ -38,66 +76,39 @@ class APIClient:
             base_url += '/'
         self.__url = base_url + 'index.php?/api/v2/'
 
-    #
-    # Send Get
-    #
-    # Issues a GET request (read) against the API and returns the result
-    # (as Python dict).
-    #
-    # Arguments:
-    #
-    # uri                 The API method to call including parameters
-    #                     (e.g. get_case/1)
-    #
     def send_get(self, uri):
         return self.__send_request('GET', uri, None)
 
-    #
-    # Send POST
-    #
-    # Issues a POST request (write) against the API and returns the result
-    # (as Python dict).
-    #
-    # Arguments:
-    #
-    # uri                 The API method to call including parameters
-    #                     (e.g. add_case/1)
-    # data                The data to submit as part of the request (as
-    #                     Python dict, strings must be UTF-8 encoded)
-    #
     def send_post(self, uri, data):
         return self.__send_request('POST', uri, data)
 
     def __send_request(self, method, uri, data):
+        retry_codes = {429: 3,
+                       503: 10}
+
+        @request_retry(codes=retry_codes)
+        def __get_response(_url, _headers, _data):
+            if method == 'POST':
+                return requests.post(_url, json=_data, headers=_headers)
+            return requests.get(_url, headers=_headers)
+
         url = self.__url + uri
-        request = urllib2.Request(url)
-        if method == 'POST':
-            request.add_data(json.dumps(data))
+
         auth = base64.encodestring(
-            '%s:%s' % (self.user, self.password)).strip()
-        request.add_header('Authorization', 'Basic %s' % auth)
-        request.add_header('Content-Type', 'application/json')
+            '{0}:{1}'.format(self.user, self.password)).strip()
 
-        e = None
+        headers = {'Authorization': 'Basic {}'.format(auth),
+                   'Content-Type': 'application/json'}
+
         try:
-            response = urllib2.urlopen(request).read()
-        except urllib2.HTTPError as e:
-            response = e.read()
-
-        if response:
-            result = json.loads(response)
-        else:
-            result = {}
-
-        if e is not None:
-            if result and 'error' in result:
-                error = '"' + result['error'] + '"'
+            return __get_response(url, headers, data)
+        except HTTPError as e:
+            if e.message:
+                error = e.message
             else:
                 error = 'No additional error message received'
-            raise APIError('TestRail API returned HTTP %s (%s)' %
-                           (e.code, error))
-
-        return result
+            raise APIError('TestRail API returned HTTP {0}: "{1}"'.format(
+                e.response.status_code, error))
 
 
 class APIError(Exception):

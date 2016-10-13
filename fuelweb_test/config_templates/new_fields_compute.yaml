@@ -1,0 +1,4 @@
+---
+nova_config:
+  fuel_qa/service_reconfiguration_8:
+    value: "InProgress"

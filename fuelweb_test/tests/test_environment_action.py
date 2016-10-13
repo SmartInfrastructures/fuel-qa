@@ -12,16 +12,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import traceback
-
 from proboscis import asserts
 from proboscis import test
-
 from fuelweb_test.helpers.decorators import check_fuel_statistics
 from fuelweb_test.helpers.decorators import log_snapshot_after_test
-from fuelweb_test.helpers import os_actions
-from fuelweb_test import settings as hlp_data
-from fuelweb_test import logger
+from fuelweb_test import settings
 from fuelweb_test.tests import base_test_case
 
 
@@ -30,38 +25,39 @@ class EnvironmentAction(base_test_case.TestBasic):
     """EnvironmentAction."""  # TODO documentation
 
     @test(depends_on=[base_test_case.SetupEnvironment.prepare_slaves_3],
-          groups=["smoke", "deploy_flat_stop_reset_on_deploying",
+          groups=["smoke", "deploy_neutron_stop_reset_on_deploying",
                   "classic_provisioning"])
     @log_snapshot_after_test
     @check_fuel_statistics
-    def deploy_flat_stop_on_deploying(self):
-        """Stop reset cluster in HA mode with flat nova-network
+    def deploy_neutron_stop_on_deploying(self):
+        """Stop reset cluster in HA mode with neutron
 
         Scenario:
             1. Create cluster in HA mode with 1 controller
             2. Add 1 node with controller role
             3. Add 1 node with compute role
-            4. Run provisioning task
-            5. Run deployment task
-            6. Stop deployment
-            7. Add 1 node with cinder role
-            8. Re-deploy cluster
-            9. Run OSTF
+            4. Verify network
+            5. Run provisioning task
+            6. Run deployment task
+            7. Stop deployment
+            8. Add 1 node with cinder role
+            9. Re-deploy cluster
+            10. Verify network
+            11. Run OSTF
 
         Duration 50m
-        Snapshot: deploy_flat_stop_reset_on_deploying
+        Snapshot: deploy_neutron_stop_reset_on_deploying
 
         """
         self.env.revert_snapshot("ready_with_3_slaves")
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
-            mode=hlp_data.DEPLOYMENT_MODE,
+            mode=settings.DEPLOYMENT_MODE,
             settings={
                 'tenant': 'stop_deploy',
                 'user': 'stop_deploy',
-                'password': 'stop_deploy'
-
+                'password': 'stop_deploy',
             }
         )
         self.fuel_web.update_nodes(
@@ -71,6 +67,8 @@ class EnvironmentAction(base_test_case.TestBasic):
                 'slave-02': ['compute']
             }
         )
+
+        self.fuel_web.verify_network(cluster_id)
 
         self.fuel_web.provisioning_cluster_wait(cluster_id)
         self.fuel_web.deploy_task_wait(cluster_id=cluster_id, progress=10)
@@ -90,37 +88,41 @@ class EnvironmentAction(base_test_case.TestBasic):
         asserts.assert_equal(
             3, len(self.fuel_web.client.list_cluster_nodes(cluster_id)))
 
+        self.fuel_web.verify_network(cluster_id)
+
         self.fuel_web.run_ostf(
             cluster_id=cluster_id)
 
-        self.env.make_snapshot("deploy_flat_stop_reset_on_deploying")
+        self.env.make_snapshot("deploy_neutron_stop_reset_on_deploying")
 
     @test(depends_on=[base_test_case.SetupEnvironment.prepare_slaves_3],
-          groups=["smoke", "deploy_flat_stop_reset_on_provisioning"])
+          groups=["smoke", "deploy_neutron_stop_reset_on_provisioning"])
     @log_snapshot_after_test
-    def deploy_flat_stop_reset_on_provisioning(self):
-        """Stop provisioning cluster in HA mode with flat nova-network
+    def deploy_neutron_stop_reset_on_provisioning(self):
+        """Stop provisioning cluster in HA mode with neutron
 
         Scenario:
             1. Create cluster in HA mode with 1 controller
             2. Add 1 node with controller role
             3. Add 1 node with compute role
-            4. Run provisioning task
-            5. Stop provisioning
-            6. Reset settings
-            7. Add 1 node with cinder role
-            8. Re-deploy cluster
-            9. Run OSTF
+            4. Verify network
+            5. Run provisioning task
+            6. Stop provisioning
+            7. Reset settings
+            8. Add 1 node with cinder role
+            9. Re-deploy cluster
+            10. Verify network
+            11. Run OSTF
 
         Duration 40m
-        Snapshot: deploy_flat_stop_reset_on_deploying
+        Snapshot: deploy_neutron_stop_reset_on_provisioning
 
         """
         self.env.revert_snapshot("ready_with_3_slaves")
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
-            mode=hlp_data.DEPLOYMENT_MODE
+            mode=settings.DEPLOYMENT_MODE,
         )
         self.fuel_web.update_nodes(
             cluster_id,
@@ -130,12 +132,14 @@ class EnvironmentAction(base_test_case.TestBasic):
             }
         )
 
+        self.fuel_web.verify_network(cluster_id)
+
         self.fuel_web.provisioning_cluster_wait(
             cluster_id=cluster_id, progress=20)
-        try:
-            self.fuel_web.stop_deployment_wait(cluster_id)
-        except Exception:
-            logger.debug(traceback.format_exc())
+
+        self.fuel_web.stop_deployment_wait(cluster_id)
+
+        self.fuel_web.stop_reset_env_wait(cluster_id)
 
         self.fuel_web.wait_nodes_get_online_state(
             self.env.d_env.nodes().slaves[:2], timeout=10 * 60)
@@ -151,10 +155,12 @@ class EnvironmentAction(base_test_case.TestBasic):
         asserts.assert_equal(
             3, len(self.fuel_web.client.list_cluster_nodes(cluster_id)))
 
+        self.fuel_web.verify_network(cluster_id)
+
         self.fuel_web.run_ostf(
             cluster_id=cluster_id)
 
-        self.env.make_snapshot("deploy_flat_stop_reset_on_provisioning")
+        self.env.make_snapshot("deploy_neutron_stop_reset_on_provisioning")
 
     @test(depends_on=[base_test_case.SetupEnvironment.prepare_slaves_3],
           groups=["smoke", "deploy_reset_on_ready"])
@@ -167,12 +173,13 @@ class EnvironmentAction(base_test_case.TestBasic):
             1. Create cluster in Ha mode with 1 controller
             2. Add 1 node with controller role
             3. Add 1 node with compute role
-            4. Deploy cluster
-            5. Reset settings
-            6. Update net
-            7. Re-deploy cluster
-            8. Verify network
-            9. Run OSTF
+            4. Verify network
+            5. Deploy cluster
+            6. Reset settings
+            7. Update net
+            8. Re-deploy cluster
+            9. Verify network
+            10. Run OSTF
 
         Duration 40m
         Snapshot: deploy_reset_on_ready
@@ -182,7 +189,7 @@ class EnvironmentAction(base_test_case.TestBasic):
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
-            mode=hlp_data.DEPLOYMENT_MODE
+            mode=settings.DEPLOYMENT_MODE,
         )
         self.fuel_web.update_nodes(
             cluster_id,
@@ -192,23 +199,15 @@ class EnvironmentAction(base_test_case.TestBasic):
             }
         )
 
+        self.fuel_web.verify_network(cluster_id)
+
         self.fuel_web.deploy_cluster_wait(cluster_id)
-        os_conn = os_actions.OpenStackActions(
-            self.fuel_web.get_public_vip(cluster_id))
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=6, networks_count=1, timeout=300)
 
         self.fuel_web.stop_reset_env_wait(cluster_id)
         self.fuel_web.wait_nodes_get_online_state(
             self.env.d_env.nodes().slaves[:2], timeout=10 * 60)
 
-        self.fuel_web.update_vlan_network_fixed(
-            cluster_id, amount=8, network_size=32)
         self.fuel_web.deploy_cluster_wait(cluster_id)
-        os_conn = os_actions.OpenStackActions(
-            self.fuel_web.get_public_vip(cluster_id))
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=6, networks_count=8, timeout=300)
 
         self.fuel_web.verify_network(cluster_id)
 
@@ -218,7 +217,7 @@ class EnvironmentAction(base_test_case.TestBasic):
         self.env.make_snapshot("deploy_reset_on_ready")
 
 
-@test(groups=["cluster_actions"])
+@test(groups=["cluster_actions_ha"])
 class EnvironmentActionOnHA(base_test_case.TestBasic):
     """EnvironmentActionOnHA."""  # TODO documentation
 
@@ -231,12 +230,14 @@ class EnvironmentActionOnHA(base_test_case.TestBasic):
         Scenario:
             1. Create cluster
             2. Add 3 node with controller role
-            3. Deploy cluster
-            4. Stop deployment
-            5. Reset settings
-            6. Add 2 nodes with compute role
-            7. Re-deploy cluster
-            8. Run OSTF
+            3. Verify network
+            4. Deploy cluster
+            5. Stop deployment
+            6. Reset settings
+            7. Add 2 nodes with compute role
+            8. Re-deploy cluster
+            9. Verify network
+            10. Run OSTF
 
         Duration 60m
         Snapshot: deploy_stop_reset_on_ha
@@ -246,8 +247,7 @@ class EnvironmentActionOnHA(base_test_case.TestBasic):
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
-            mode=hlp_data.DEPLOYMENT_MODE_HA
-
+            mode=settings.DEPLOYMENT_MODE_HA,
         )
         self.fuel_web.update_nodes(
             cluster_id,
@@ -257,6 +257,8 @@ class EnvironmentActionOnHA(base_test_case.TestBasic):
                 'slave-03': ['controller']
             }
         )
+
+        self.fuel_web.verify_network(cluster_id)
 
         self.fuel_web.deploy_cluster_wait_progress(cluster_id, progress=10)
         self.fuel_web.stop_deployment_wait(cluster_id)
@@ -271,10 +273,6 @@ class EnvironmentActionOnHA(base_test_case.TestBasic):
         )
 
         self.fuel_web.deploy_cluster_wait(cluster_id)
-        os_conn = os_actions.OpenStackActions(
-            self.fuel_web.get_public_vip(cluster_id))
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=16, networks_count=1, timeout=300)
 
         self.fuel_web.verify_network(cluster_id)
 
@@ -295,31 +293,33 @@ class ControllerReplacement(base_test_case.TestBasic):
     """
 
     @test(depends_on=[base_test_case.SetupEnvironment.prepare_slaves_5],
-          groups=["deploy_ha_neutron_gre_ctrl_replacement"])
+          groups=["deploy_ha_neutron_tun_ctrl_replacement"])
     @log_snapshot_after_test
-    def deploy_ha_neutron_gre_ctrl_replacement(self):
-        """Replace 1 controller and re-deploy on ha env with neutron gre
+    def deploy_ha_neutron_tun_ctrl_replacement(self):
+        """Replace 1 controller and re-deploy on ha env with neutron vxlan
 
         Scenario:
-            1. Create cluster with neutron gre
+            1. Create cluster with Neutron VXLAN
             2. Add 3 node with controller role
             3. Add 1 node with compute
-            3. Deploy cluster
-            4. Remove one controller add new controller
-            5. Deploy changes
-            6. Run OSTF
+            4. Verify network
+            5. Deploy cluster
+            6. Remove one controller add new controller
+            7. Deploy changes
+            8. Verify network
+            9. Run OSTF
 
         Duration 90m
-        Snapshot: deploy_ha_neutron_gre_ctrl_replacement
-
+        Snapshot: deploy_ha_neutron_tun_ctrl_replacement
         """
+
         self.env.revert_snapshot("ready_with_5_slaves")
 
-        data = {"net_provider": "neutron", "net_segment_type": 'gre'}
+        data = {"net_provider": "neutron", "net_segment_type": 'tun'}
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
-            mode=hlp_data.DEPLOYMENT_MODE_HA,
+            mode=settings.DEPLOYMENT_MODE_HA,
             settings=data
 
         )
@@ -333,20 +333,22 @@ class ControllerReplacement(base_test_case.TestBasic):
             }
         )
 
+        self.fuel_web.verify_network(cluster_id)
+
         self.fuel_web.deploy_cluster_wait(cluster_id)
         self.fuel_web.update_nodes(
             cluster_id, {'slave-05': ['controller']}, True, False)
         self.fuel_web.update_nodes(
             cluster_id, {'slave-01': ['controller']}, False, True)
 
-        # Disable check services here, according to nova-manage shows
-        #  XXX for node that we remove
-        self.fuel_web.deploy_cluster_wait(cluster_id, check_services=False)
-        self.fuel_web.run_ostf(cluster_id,
-                               test_sets=['ha', 'smoke', 'sanity'],
-                               should_fail=1)
+        self.fuel_web.deploy_cluster_wait(cluster_id)
 
-        self.env.make_snapshot("deploy_ha_neutron_gre_ctrl_replacement")
+        self.fuel_web.verify_network(cluster_id)
+
+        self.fuel_web.run_ostf(cluster_id,
+                               test_sets=['ha', 'smoke', 'sanity'])
+
+        self.env.make_snapshot("deploy_ha_neutron_tun_ctrl_replacement")
 
     @test(depends_on=[base_test_case.SetupEnvironment.prepare_slaves_5],
           groups=["deploy_ha_neutron_vlan_ctrl_replacement"])
@@ -358,22 +360,24 @@ class ControllerReplacement(base_test_case.TestBasic):
             1. Create cluster with neutron vlan
             2. Add 3 node with controller role
             3. Add 1 node with compute
-            3. Deploy cluster
-            4. Remove one controller add new controller
-            5. Deploy changes
-            6. Run OSTF
+            4. Verify network
+            5. Deploy cluster
+            6. Remove one controller add new controller
+            7. Deploy changes
+            8. Verify network
+            9. Run OSTF
 
         Duration 90m
         Snapshot: deploy_ha_neutron_vlan_ctrl_replacement
-
         """
+
         self.env.revert_snapshot("ready_with_5_slaves")
 
         data = {"net_provider": "neutron", "net_segment_type": 'vlan'}
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
-            mode=hlp_data.DEPLOYMENT_MODE_HA,
+            mode=settings.DEPLOYMENT_MODE_HA,
             settings=data
 
         )
@@ -387,45 +391,51 @@ class ControllerReplacement(base_test_case.TestBasic):
             }
         )
 
+        self.fuel_web.verify_network(cluster_id)
+
         self.fuel_web.deploy_cluster_wait(cluster_id)
         self.fuel_web.update_nodes(
             cluster_id, {'slave-05': ['controller']}, True, False)
         self.fuel_web.update_nodes(
             cluster_id, {'slave-01': ['controller']}, False, True)
 
-        # Disable check services here, according to nova-manage shows
-        #  XXX for node that we remove
-        self.fuel_web.deploy_cluster_wait(cluster_id, check_services=False)
+        self.fuel_web.deploy_cluster_wait(cluster_id)
+
+        self.fuel_web.verify_network(cluster_id)
+
         self.fuel_web.run_ostf(cluster_id,
-                               test_sets=['ha', 'smoke', 'sanity'],
-                               should_fail=1)
+                               test_sets=['ha', 'smoke', 'sanity'])
 
-        self.env.make_snapshot("deploy_ha_neutron_gre_ctrl_replacement")
+        self.env.make_snapshot("deploy_ha_neutron_vlan_ctrl_replacement")
 
-    @test(depends_on=[base_test_case.SetupEnvironment.prepare_slaves_5],
+    @test(enabled=False,
+          depends_on=[base_test_case.SetupEnvironment.prepare_slaves_5],
           groups=["deploy_ha_nova_ctrl_replacement"])
     @log_snapshot_after_test
     def deploy_ha_nova_ctrl_replacement(self):
+        # REMOVE THIS NOVA_NETWORK CASE WHEN NEUTRON BE DEFAULT
         """Replace 1 controller and re-deploy on ha env with nova
 
         Scenario:
             1. Create cluster with nova
             2. Add 3 node with controller role
             3. Add 1 node with compute
-            3. Deploy cluster
-            4. Remove one controller add new controller
-            5. Deploy changes
-            6. Run OSTF
+            4. Verify network
+            5. Deploy cluster
+            6. Remove one controller add new controller
+            7. Deploy changes
+            8. Verify network
+            9. Run OSTF
 
         Duration 90m
         Snapshot: deploy_ha_nova_ctrl_replacement
-
         """
+
         self.env.revert_snapshot("ready_with_5_slaves")
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
-            mode=hlp_data.DEPLOYMENT_MODE_HA,
+            mode=settings.DEPLOYMENT_MODE_HA,
 
         )
         self.fuel_web.update_nodes(
@@ -438,17 +448,19 @@ class ControllerReplacement(base_test_case.TestBasic):
             }
         )
 
+        self.fuel_web.verify_network(cluster_id)
+
         self.fuel_web.deploy_cluster_wait(cluster_id)
         self.fuel_web.update_nodes(
             cluster_id, {'slave-05': ['controller']}, True, False)
         self.fuel_web.update_nodes(
             cluster_id, {'slave-01': ['controller']}, False, True)
 
-        # Disable check services here, according to nova-manage shows
-        #  XXX for node that we remove
-        self.fuel_web.deploy_cluster_wait(cluster_id, check_services=False)
+        self.fuel_web.deploy_cluster_wait(cluster_id)
+
+        self.fuel_web.verify_network(cluster_id)
+
         self.fuel_web.run_ostf(cluster_id,
-                               test_sets=['ha', 'smoke', 'sanity'],
-                               should_fail=1)
+                               test_sets=['ha', 'smoke', 'sanity'])
 
         self.env.make_snapshot("deploy_ha_nova_ctrl_replacement")

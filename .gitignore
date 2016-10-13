@@ -27,6 +27,8 @@ pip-log.txt
 .coverage
 .tox
 nosetests.xml
+unit.xml
+/htmlcov/
 
 # Translations
 *.mo
@@ -47,4 +49,14 @@ local_settings.py
 doc/_build/
 
 # Logs
-sys_test.log
+/logs
+*.log
+
+# Certs
+/ca.crt
+/ca.pem
+
+# Cache
+/.cache
+/core/.cache
+__pycache__

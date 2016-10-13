@@ -13,20 +13,19 @@
 #    under the License.
 import time
 
-from devops.error import TimeoutError
-from devops.helpers.helpers import _tcp_ping
-from devops.helpers.helpers import _wait
+from devops.helpers.helpers import tcp_ping
+from devops.helpers.helpers import wait_pass
 from devops.helpers.helpers import wait
-from proboscis.asserts import assert_equal
-from proboscis.asserts import assert_false
-from proboscis.asserts import assert_true
+from proboscis import asserts
 from proboscis import test
 
-from fuelweb_test.helpers.checkers import check_auto_mode
-from fuelweb_test.helpers.checkers import check_available_mode
+from fuelweb_test.helpers import checkers
 from fuelweb_test.helpers.decorators import log_snapshot_after_test
+from fuelweb_test.helpers.cic_maintenance_mode import change_config
+from fuelweb_test.helpers.cic_maintenance_mode import check_auto_mode
+from fuelweb_test.helpers.cic_maintenance_mode import check_available_mode
 from fuelweb_test import logger
-from fuelweb_test import ostf_test_mapping as map_ostf
+from fuelweb_test import ostf_test_mapping
 from fuelweb_test import settings
 from fuelweb_test.tests.base_test_case import SetupEnvironment
 from fuelweb_test.tests.base_test_case import TestBasic
@@ -34,7 +33,7 @@ from fuelweb_test.tests.base_test_case import TestBasic
 
 @test(groups=["cic_maintenance_mode"])
 class CICMaintenanceMode(TestBasic):
-    """CICMaintenanceMode."""  # TODO documentation
+    """CICMaintenanceMode."""
 
     @test(depends_on=[SetupEnvironment.prepare_slaves_5],
           groups=["cic_maintenance_mode_env"])
@@ -50,9 +49,10 @@ class CICMaintenanceMode(TestBasic):
 
         Duration 100m
         """
+        self.check_run('cic_maintenance_mode')
         self.env.revert_snapshot("ready_with_5_slaves")
         data = {
-            'ceilometer': True
+            'ceilometer': True,
         }
 
         cluster_id = self.fuel_web.create_cluster(
@@ -102,86 +102,69 @@ class CICMaintenanceMode(TestBasic):
 
         cluster_id = self.fuel_web.get_last_created_cluster()
 
-        for nailgun_node in self.env.d_env.nodes().slaves[0:3]:
-            remote = self.fuel_web.get_ssh_for_node(nailgun_node.name)
-            assert_true('True' in check_available_mode(remote),
-                        "Maintenance mode is not available")
+        # Select a non-primary controller
+        regular_ctrl = self.fuel_web.get_nailgun_node_by_name("slave-02")
+        dregular_ctrl = self.fuel_web.get_devops_node_by_nailgun_node(
+            regular_ctrl)
+        _ip = regular_ctrl['ip']
+        _id = regular_ctrl['id']
+        logger.info('Maintenance mode for node-{0}'.format(_id))
+        asserts.assert_true('True' in check_available_mode(_ip),
+                            "Maintenance mode is not available")
+        self.ssh_manager.execute_on_remote(
+            ip=_ip,
+            cmd="umm on")
 
-            logger.info('Maintenance mode for node %s', nailgun_node.name)
-            result = remote.execute('umm on')
-            assert_equal(result['exit_code'], 0,
-                         'Failed to execute "{0}" on remote host: {1}'.
-                         format('umm on', result))
-            logger.info('Wait a %s node offline status after switching '
-                        'maintenance mode ', nailgun_node.name)
-            try:
-                wait(
-                    lambda: not
-                    self.fuel_web.get_nailgun_node_by_devops_node(nailgun_node)
-                    ['online'], timeout=60 * 10)
-            except TimeoutError:
-                assert_false(
-                    self.fuel_web.get_nailgun_node_by_devops_node(nailgun_node)
-                    ['online'],
-                    'Node {0} has not become offline after'
-                    'switching maintenance mode'.format(nailgun_node.name))
+        self.fuel_web.wait_node_is_offline(dregular_ctrl)
 
-            logger.info('Check that %s node in maintenance mode after '
-                        'switching', nailgun_node.name)
+        asserts.assert_true(
+            checkers.check_ping(self.env.get_admin_node_ip(),
+                                _ip,
+                                deadline=600),
+            "Host {0} is not reachable by ping during 600 sec"
+            .format(_ip))
 
-            remote = self.fuel_web.get_ssh_for_node(nailgun_node.name)
-            assert_true('True' in check_auto_mode(remote),
-                        "Maintenance mode is not switch")
+        asserts.assert_true('True' in check_auto_mode(_ip),
+                            "Maintenance mode is not switched on")
 
-            result = remote.execute('umm off')
-            assert_equal(result['exit_code'], 0,
-                         'Failed to execute "{0}" on remote host: {1}'.
-                         format('umm off', result))
+        self.ssh_manager.execute_on_remote(
+            ip=_ip,
+            cmd="umm off")
 
-            logger.info('Wait a %s node online status', nailgun_node.name)
-            try:
-                wait(
-                    lambda:
-                    self.fuel_web.get_nailgun_node_by_devops_node(nailgun_node)
-                    ['online'], timeout=60 * 10)
-            except TimeoutError:
-                assert_true(
-                    self.fuel_web.get_nailgun_node_by_devops_node(nailgun_node)
-                    ['online'],
-                    'Node {0} has not become online after '
-                    'exiting maintenance mode'.format(nailgun_node.name))
+        self.fuel_web.wait_node_is_online(dregular_ctrl)
 
-            # Wait until MySQL Galera is UP on some controller
-            self.fuel_web.wait_mysql_galera_is_up(
-                [n.name for n in self.env.d_env.nodes().slaves[0:3]])
+        # Wait until Cinder services UP on a controller
+        self.fuel_web.wait_cinder_is_up(
+            [dregular_ctrl.name])
 
-            # Wait until Cinder services UP on a controller
-            self.fuel_web.wait_cinder_is_up(
-                [n.name for n in self.env.d_env.nodes().slaves[0:3]])
+        # Wait until RabbitMQ cluster is UP
+        wait_pass(lambda:
+                  self.fuel_web.run_single_ostf_test(
+                      cluster_id, test_sets=['ha'],
+                      test_name=ostf_test_mapping.OSTF_TEST_MAPPING.get(
+                          'RabbitMQ availability')),
+                  timeout=1500)
+        logger.info('RabbitMQ cluster is available')
 
-            _wait(lambda:
+        wait_pass(lambda:
                   self.fuel_web.run_single_ostf_test(
                       cluster_id, test_sets=['sanity'],
-                      test_name=map_ostf.OSTF_TEST_MAPPING.get(
+                      test_name=ostf_test_mapping.OSTF_TEST_MAPPING.get(
                           'Check that required services are running')),
                   timeout=1500)
-            logger.debug("Required services are running")
+        logger.info("Required services are running")
 
-            _wait(lambda:
-                  self.fuel_web.run_ostf(cluster_id, test_sets=['ha']),
-                  timeout=1500)
-            logger.debug("HA tests are pass now")
-
-            try:
-                self.fuel_web.run_ostf(cluster_id,
-                                       test_sets=['smoke', 'sanity'])
-            except AssertionError:
-                logger.debug("Test failed from first probe,"
-                             " we sleep 600 second try one more time"
-                             " and if it fails again - test will fails ")
-                time.sleep(600)
-                self.fuel_web.run_ostf(cluster_id,
-                                       test_sets=['smoke', 'sanity'])
+        # TODO(astudenov): add timeout_msg
+        try:
+            self.fuel_web.run_ostf(cluster_id,
+                                   test_sets=['smoke', 'sanity', 'ha'])
+        except AssertionError:
+            logger.debug("Test failed from first probe,"
+                         " we sleep 600 second try one more time"
+                         " and if it fails again - test will fails ")
+            time.sleep(600)
+            self.fuel_web.run_ostf(cluster_id,
+                                   test_sets=['smoke', 'sanity', 'ha'])
 
     @test(depends_on=[cic_maintenance_mode_env],
           groups=["auto_cic_maintenance_mode",
@@ -203,105 +186,97 @@ class CICMaintenanceMode(TestBasic):
 
         cluster_id = self.fuel_web.get_last_created_cluster()
 
-        for nailgun_node in self.env.d_env.nodes().slaves[0:3]:
-            remote = self.fuel_web.get_ssh_for_node(nailgun_node.name)
-            assert_true('True' in check_available_mode(remote),
-                        "Maintenance mode is not available")
+        # Select a non-primary controller
+        regular_ctrl = self.fuel_web.get_nailgun_node_by_name("slave-02")
+        dregular_ctrl = self.fuel_web.get_devops_node_by_nailgun_node(
+            regular_ctrl)
+        _ip = regular_ctrl['ip']
+        _id = regular_ctrl['id']
 
-            logger.info('Change UMM.CONF on node %s', nailgun_node.name)
-            command1 = ("echo -e 'UMM=yes\nREBOOT_COUNT=0\n"
-                        "COUNTER_RESET_TIME=10' > /etc/umm.conf")
+        asserts.assert_true('True' in check_available_mode(_ip),
+                            "Maintenance mode is not available")
 
-            result = remote.execute(command1)
-            assert_equal(result['exit_code'], 0,
-                         'Failed to execute "{0}" on remote host: {1}'.
-                         format(command1, result))
+        change_config(_ip, reboot_count=0)
 
-            logger.info('Unexpected reboot on node %s', nailgun_node.name)
-            command2 = ('reboot --force >/dev/null & ')
-            result = remote.execute(command2)
-            assert_equal(result['exit_code'], 0,
-                         'Failed to execute "{0}" on remote host: {1}'.
-                         format(command2, result))
+        logger.info('Change UMM.CONF on node-{0}'
+                    .format(_id))
 
-            logger.info('Wait a %s node offline status after unexpected '
-                        'reboot', nailgun_node.name)
-            try:
-                wait(
-                    lambda: not
-                    self.fuel_web.get_nailgun_node_by_devops_node(nailgun_node)
-                    ['online'], timeout=60 * 10)
-            except TimeoutError:
-                assert_false(
-                    self.fuel_web.get_nailgun_node_by_devops_node(nailgun_node)
-                    ['online'],
-                    'Node {0} has not become offline after unexpected'
-                    'reboot'.format(nailgun_node.name))
+        logger.info('Unexpected reboot on node-{0}'
+                    .format(_id))
 
-            logger.info('Check that %s node in maintenance mode after'
-                        ' unexpected reboot', nailgun_node.name)
+        command = 'reboot --force >/dev/null & '
 
-            remote = self.fuel_web.get_ssh_for_node(nailgun_node.name)
-            assert_true('True' in check_auto_mode(remote),
-                        "Maintenance mode is not switch")
+        self.ssh_manager.execute_on_remote(
+            ip=_ip,
+            cmd=command)
 
-            result = remote.execute('umm off')
-            assert_equal(result['exit_code'], 0,
-                         'Failed to execute "{0}" on remote host: {1}'.
-                         format('umm off', result))
-            # Wait umm stops
-            time.sleep(30)
-            command3 = ("echo -e 'UMM=yes\nREBOOT_COUNT=2\n"
-                        "COUNTER_RESET_TIME=10' > /etc/umm.conf")
-            result = remote.execute(command3)
-            assert_equal(result['exit_code'], 0,
-                         'Failed to execute "{0}" on remote host: {1}'.
-                         format(command3, result))
+        wait(lambda:
+             not checkers.check_ping(self.env.get_admin_node_ip(),
+                                     _ip),
+             timeout=60 * 10,
+             timeout_msg='Node {} still responds to ping'.format(
+                 dregular_ctrl.name))
 
-            logger.info('Wait a %s node online status', nailgun_node.name)
-            try:
-                wait(
-                    lambda:
-                    self.fuel_web.get_nailgun_node_by_devops_node(nailgun_node)
-                    ['online'], timeout=90 * 10)
-            except TimeoutError:
-                assert_true(
-                    self.fuel_web.get_nailgun_node_by_devops_node(nailgun_node)
-                    ['online'],
-                    'Node {0} has not become online after umm off'.format(
-                        nailgun_node.name))
+        self.fuel_web.wait_node_is_offline(dregular_ctrl)
 
-            # Wait until MySQL Galera is UP on some controller
-            self.fuel_web.wait_mysql_galera_is_up(
-                [n.name for n in self.env.d_env.nodes().slaves[0:3]])
+        logger.info('Check that node-{0} in maintenance mode after'
+                    ' unexpected reboot'.format(_id))
+        asserts.assert_true(
+            checkers.check_ping(self.env.get_admin_node_ip(),
+                                _ip,
+                                deadline=600),
+            "Host {0} is not reachable by ping during 600 sec"
+            .format(_ip))
 
-            # Wait until Cinder services UP on a controller
-            self.fuel_web.wait_cinder_is_up(
-                [n.name for n in self.env.d_env.nodes().slaves[0:3]])
+        asserts.assert_true('True' in check_auto_mode(_ip),
+                            "Maintenance mode is not switched on")
 
-            _wait(lambda:
+        logger.info('turn off Maintenance mode')
+        self.ssh_manager.execute_on_remote(
+            ip=_ip,
+            cmd="umm off")
+        time.sleep(30)
+
+        change_config(_ip)
+
+        self.fuel_web.wait_node_is_online(dregular_ctrl)
+
+        # Wait until MySQL Galera is UP on some controller
+        self.fuel_web.wait_mysql_galera_is_up(
+            [dregular_ctrl.name])
+
+        # Wait until Cinder services UP on a controller
+        self.fuel_web.wait_cinder_is_up(
+            [dregular_ctrl.name])
+
+        # Wait until RabbitMQ cluster is UP
+        wait_pass(lambda:
+                  self.fuel_web.run_single_ostf_test(
+                      cluster_id, test_sets=['ha'],
+                      test_name=ostf_test_mapping.OSTF_TEST_MAPPING.get(
+                          'RabbitMQ availability')),
+                  timeout=1500)
+        logger.info('RabbitMQ cluster is available')
+
+        # Wait until all Openstack services are UP
+        wait_pass(lambda:
                   self.fuel_web.run_single_ostf_test(
                       cluster_id, test_sets=['sanity'],
-                      test_name=map_ostf.OSTF_TEST_MAPPING.get(
+                      test_name=ostf_test_mapping.OSTF_TEST_MAPPING.get(
                           'Check that required services are running')),
                   timeout=1500)
-            logger.debug("Required services are running")
+        logger.info("Required services are running")
 
-            _wait(lambda:
-                  self.fuel_web.run_ostf(cluster_id, test_sets=['ha']),
-                  timeout=1500)
-            logger.debug("HA tests are pass now")
-
-            try:
-                self.fuel_web.run_ostf(cluster_id,
-                                       test_sets=['smoke', 'sanity'])
-            except AssertionError:
-                logger.debug("Test failed from first probe,"
-                             " we sleep 600 second try one more time"
-                             " and if it fails again - test will fails ")
-                time.sleep(600)
-                self.fuel_web.run_ostf(cluster_id,
-                                       test_sets=['smoke', 'sanity'])
+        try:
+            self.fuel_web.run_ostf(cluster_id,
+                                   test_sets=['smoke', 'sanity', 'ha'])
+        except AssertionError:
+            logger.debug("Test failed from first probe,"
+                         " we sleep 600 second try one more time"
+                         " and if it fails again - test will fails ")
+            time.sleep(600)
+            self.fuel_web.run_ostf(cluster_id,
+                                   test_sets=['smoke', 'sanity', 'ha'])
 
     @test(depends_on=[cic_maintenance_mode_env],
           groups=["negative_manual_cic_maintenance_mode",
@@ -323,47 +298,49 @@ class CICMaintenanceMode(TestBasic):
 
         cluster_id = self.fuel_web.get_last_created_cluster()
 
-        for nailgun_node in self.env.d_env.nodes().slaves[0:3]:
-            remote = self.fuel_web.get_ssh_for_node(nailgun_node.name)
-            assert_true('True' in check_available_mode(remote),
-                        "Maintenance mode is not available")
+        # Select a non-primary controller
+        regular_ctrl = self.fuel_web.get_nailgun_node_by_name("slave-02")
+        dregular_ctrl = self.fuel_web.get_devops_node_by_nailgun_node(
+            regular_ctrl)
+        _ip = regular_ctrl['ip']
+        _id = regular_ctrl['id']
 
-            logger.info('Maintenance mode for node %s is disable',
-                        nailgun_node.name)
-            result = remote.execute('umm disable')
-            assert_equal(result['exit_code'], 0,
-                         'Failed to execute "{0}" on remote host: {1}'.
-                         format('umm disable', result))
+        asserts.assert_true('True' in check_available_mode(_ip),
+                            "Maintenance mode is not available")
+        self.ssh_manager.execute_on_remote(
+            ip=_ip,
+            cmd="umm disable")
 
-            assert_false('True' in check_available_mode(remote),
-                         "Maintenance mode should not be available")
+        asserts.assert_false('True' in check_available_mode(_ip),
+                             "Maintenance mode should not be available")
 
-            logger.info('Try to execute maintenance mode for node %s',
-                        nailgun_node.name)
-            result = remote.execute('umm on')
-            assert_equal(result['exit_code'], 1,
-                         'Failed to execute "{0}" on remote host: {1}'.
-                         format('umm on', result))
+        logger.info('Try to execute maintenance mode '
+                    'for node-{0}'.format(_id))
 
-            # If we don't disable maintenance mode,
-            # the node would have gone to reboot, so we just expect
-            time.sleep(30)
-            assert_true(
-                self.fuel_web.get_nailgun_node_by_devops_node(nailgun_node)
-                ['online'],
-                'Node {0} should be online after command "umm on"'.
-                format(nailgun_node.name))
+        self.ssh_manager.execute_on_remote(
+            ip=_ip,
+            cmd="umm on",
+            assert_ec_equal=[1])
 
-            try:
-                self.fuel_web.run_ostf(cluster_id, test_sets=['ha', 'smoke',
-                                                              'sanity'])
-            except AssertionError:
-                logger.debug("Test failed from first probe,"
-                             " we sleep 300 second try one more time"
-                             " and if it fails again - test will fails ")
-                time.sleep(300)
-                self.fuel_web.run_ostf(cluster_id, test_sets=['ha', 'smoke',
-                                                              'sanity'])
+        # If we don't disable maintenance mode,
+        # the node would have gone to reboot, so we just expect
+        time.sleep(30)
+        asserts.assert_true(
+            self.fuel_web.get_nailgun_node_by_devops_node(dregular_ctrl)
+            ['online'],
+            'Node-{0} should be online after command "umm on"'.
+            format(_id))
+
+        try:
+            self.fuel_web.run_ostf(cluster_id, test_sets=['ha', 'smoke',
+                                                          'sanity'])
+        except AssertionError:
+            logger.debug("Test failed from first probe,"
+                         " we sleep 300 second try one more time"
+                         " and if it fails again - test will fails ")
+            time.sleep(300)
+            self.fuel_web.run_ostf(cluster_id, test_sets=['ha', 'smoke',
+                                                          'sanity'])
 
     @test(depends_on=[cic_maintenance_mode_env],
           groups=["negative_auto_cic_maintenance_mode",
@@ -386,82 +363,95 @@ class CICMaintenanceMode(TestBasic):
 
         cluster_id = self.fuel_web.get_last_created_cluster()
 
-        for nailgun_node in self.env.d_env.nodes().slaves[0:3]:
-            remote = self.fuel_web.get_ssh_for_node(nailgun_node.name)
-            assert_true('True' in check_available_mode(remote),
-                        "Maintenance mode is not available")
+        # Select a non-primary controller
+        regular_ctrl = self.fuel_web.get_nailgun_node_by_name("slave-02")
+        dregular_ctrl = self.fuel_web.get_devops_node_by_nailgun_node(
+            regular_ctrl)
+        _ip = regular_ctrl['ip']
+        _id = regular_ctrl['id']
 
-            logger.info('Change UMM.CONF on node %s', nailgun_node.name)
-            command1 = ("echo -e 'UMM=yes\nREBOOT_COUNT=0\n"
-                        "COUNTER_RESET_TIME=10' > /etc/umm.conf")
+        asserts.assert_true('True' in check_available_mode(_ip),
+                            "Maintenance mode is not available")
+        logger.info('Disable UMM  on node-{0}'.format(_id))
 
-            result = remote.execute(command1)
-            assert_equal(result['exit_code'], 0,
-                         'Failed to execute "{0}" on remote host: {1}'.
-                         format(command1, result))
+        change_config(_ip, umm=False, reboot_count=0)
 
-            result = remote.execute('umm disable')
-            assert_equal(result['exit_code'], 0,
-                         'Failed to execute "{0}" on remote host: {1}'.
-                         format('umm disable', result))
+        asserts.assert_false('True' in check_available_mode(_ip),
+                             "Maintenance mode should not be available")
 
-            assert_false('True' in check_available_mode(remote),
-                         "Maintenance mode should not be available")
+        command = 'reboot --force >/dev/null & '
 
-            logger.info('Unexpected reboot on node %s', nailgun_node.name)
-            command2 = ('reboot --force >/dev/null & ')
-            result = remote.execute(command2)
-            assert_equal(result['exit_code'], 0,
-                         'Failed to execute "{0}" on remote host: {1}'.
-                         format(command2, result))
+        logger.info('Unexpected reboot on node-{0}'
+                    .format(_id))
 
-            # Node don't have enough time for set offline status
-            # after reboot --force
-            # Just waiting
+        self.ssh_manager.execute_on_remote(
+            ip=_ip,
+            cmd=command)
 
-            _ip = self.fuel_web.get_nailgun_node_by_name(
-                nailgun_node.name)['ip']
-            _wait(lambda: _tcp_ping(_ip, 22), timeout=120)
+        wait(lambda:
+             not checkers.check_ping(self.env.get_admin_node_ip(),
+                                     _ip),
+             timeout=60 * 10,
+             timeout_msg='Node {} still responds to ping'.format(
+                 dregular_ctrl.name))
 
-            logger.info('Wait a %s node online status after unexpected '
-                        'reboot', nailgun_node.name)
-            self.fuel_web.wait_nodes_get_online_state([nailgun_node])
+        # Node don't have enough time for set offline status
+        # after reboot --force
+        # Just waiting
 
-            logger.info('Check that %s node not in maintenance mode after'
-                        ' unexpected reboot', nailgun_node.name)
+        asserts.assert_true(
+            checkers.check_ping(self.env.get_admin_node_ip(),
+                                _ip,
+                                deadline=600),
+            "Host {0} is not reachable by ping during 600 sec"
+            .format(_ip))
 
-            remote = self.fuel_web.get_ssh_for_node(nailgun_node.name)
-            assert_false('True' in check_auto_mode(remote),
-                         "Maintenance mode should not switched")
+        self.fuel_web.wait_node_is_online(dregular_ctrl)
 
-            # Wait until MySQL Galera is UP on some controller
-            self.fuel_web.wait_mysql_galera_is_up(
-                [n.name for n in self.env.d_env.nodes().slaves[0:3]])
+        logger.info('Check that node-{0} not in maintenance mode after'
+                    ' unexpected reboot'.format(_id))
 
-            # Wait until Cinder services UP on a controller
-            self.fuel_web.wait_cinder_is_up(
-                [n.name for n in self.env.d_env.nodes().slaves[0:3]])
+        wait(lambda: tcp_ping(_ip, 22),
+             timeout=60 * 10,
+             timeout_msg='Node {} still is not available by SSH'.format(
+                 dregular_ctrl.name))
 
-            _wait(lambda:
+        asserts.assert_false('True' in check_auto_mode(_ip),
+                             "Maintenance mode should not switched")
+
+        # Wait until MySQL Galera is UP on some controller
+        self.fuel_web.wait_mysql_galera_is_up(
+            [dregular_ctrl.name])
+
+        # Wait until Cinder services UP on a controller
+        self.fuel_web.wait_cinder_is_up(
+            [dregular_ctrl.name])
+
+        # Wait until RabbitMQ cluster is UP
+        wait_pass(lambda:
+                  self.fuel_web.run_single_ostf_test(
+                      cluster_id, test_sets=['ha'],
+                      test_name=ostf_test_mapping.OSTF_TEST_MAPPING.get(
+                          'RabbitMQ availability')),
+                  timeout=1500)
+        logger.info('RabbitMQ cluster is available')
+
+        # TODO(astudenov): add timeout_msg
+        wait_pass(lambda:
                   self.fuel_web.run_single_ostf_test(
                       cluster_id, test_sets=['sanity'],
-                      test_name=map_ostf.OSTF_TEST_MAPPING.get(
+                      test_name=ostf_test_mapping.OSTF_TEST_MAPPING.get(
                           'Check that required services are running')),
                   timeout=1500)
-            logger.debug("Required services are running")
+        logger.info("Required services are running")
 
-            _wait(lambda:
-                  self.fuel_web.run_ostf(cluster_id, test_sets=['ha']),
-                  timeout=1500)
-            logger.debug("HA tests are pass now")
-
-            try:
-                self.fuel_web.run_ostf(cluster_id,
-                                       test_sets=['smoke', 'sanity'])
-            except AssertionError:
-                logger.debug("Test failed from first probe,"
-                             " we sleep 600 second try one more time"
-                             " and if it fails again - test will fails ")
-                time.sleep(600)
-                self.fuel_web.run_ostf(cluster_id,
-                                       test_sets=['smoke', 'sanity'])
+        try:
+            self.fuel_web.run_ostf(cluster_id,
+                                   test_sets=['smoke', 'sanity', 'ha'])
+        except AssertionError:
+            logger.debug("Test failed from first probe,"
+                         " we sleep 600 second try one more time"
+                         " and if it fails again - test will fails ")
+            time.sleep(600)
+            self.fuel_web.run_ostf(cluster_id,
+                                   test_sets=['smoke', 'sanity', 'ha'])

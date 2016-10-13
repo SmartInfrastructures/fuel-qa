@@ -12,12 +12,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from settings import logger
-from testrail import APIClient
-from testrail import APIError
+from __future__ import unicode_literals
+
+from fuelweb_test.testrail.settings import logger
+from fuelweb_test.testrail.testrail import APIClient
+from fuelweb_test.testrail.testrail import APIError
 
 
-class TestRailProject():
+class TestRailProject(object):
     """TestRailProject."""  # TODO documentation
 
     def __init__(self, url, user, password, project):
@@ -80,6 +82,10 @@ class TestRailProject():
         for config in self.get_configs():
             if config['name'] == name:
                 return config
+
+    def get_priorities(self):
+        priorities_uri = 'get_priorities'
+        return self.client.send_get(uri=priorities_uri)
 
     def get_milestones(self):
         milestones_uri = 'get_milestones/{project_id}'.format(
@@ -167,22 +173,30 @@ class TestRailProject():
         add_case_uri = 'add_case/{section_id}'.format(section_id=section_id)
         return self.client.send_post(add_case_uri, case)
 
+    def update_case(self, case_id, fields):
+        return self.client.send_post('update_case/{0}'.format(case_id), fields)
+
     def delete_case(self, case_id):
         return self.client.send_post('delete_case/' + str(case_id), None)
 
-    def get_plans(self):
+    def get_case_fields(self):
+        return self.client.send_get('get_case_fields')
+
+    def get_plans(self, milestone_ids=None, limit=None, offset=None):
         plans_uri = 'get_plans/{project_id}'.format(
             project_id=self.project['id'])
+        if milestone_ids:
+            plans_uri += '&milestone_id=' + ','.join([str(m)
+                                                      for m in milestone_ids])
+        if limit:
+            plans_uri += '&limit={0}'.format(limit)
+        if offset:
+            plans_uri += '&offset={0}'.format(offset)
         return self.client.send_get(plans_uri)
 
     def get_plan(self, plan_id):
         plan_uri = 'get_plan/{plan_id}'.format(plan_id=plan_id)
         return self.client.send_get(plan_uri)
-
-    def get_plans_by_milestone(self, milestone_id):
-        plans = self.get_plans()
-        return [self.get_plan(plan['id']) for plan in plans
-                if plan['milestone_id'] == milestone_id]
 
     def get_plan_by_name(self, name):
         for plan in self.get_plans():
@@ -199,6 +213,23 @@ class TestRailProject():
             'entries': entries
         }
         return self.client.send_post(add_plan_uri, new_plan)
+
+    def update_plan(self, plan_id, name='', description='',
+                    milestone_id=None, entries=None):
+        if entries is None:
+            entries = []
+        update_plan_uri = 'update_plan/{plan_id}'.format(
+            plan_id=plan_id)
+        updated_plan = {}
+        if name:
+            updated_plan['name'] = name
+        if description:
+            updated_plan['description'] = description
+        if milestone_id:
+            updated_plan['milestone_id'] = milestone_id
+        if entries:
+            updated_plan['entries'] = entries
+        return self.client.send_post(update_plan_uri, updated_plan)
 
     def add_plan_entry(self, plan_id, suite_id, config_ids, runs, name=None):
         add_plan_entry_uri = 'add_plan_entry/{plan_id}'.format(plan_id=plan_id)
@@ -229,15 +260,27 @@ class TestRailProject():
             if run['name'] == name:
                 return self.get_run(run_id=run['id'])
 
-    def get_previous_runs(self, milestone_id, suite_id, config_id):
-        all_runs = []
-        for plan in self.get_plans_by_milestone(milestone_id=milestone_id):
-            for entry in plan['entries']:
-                if entry['suite_id'] == suite_id:
-                    run_ids = [run for run in entry['runs'] if
-                               config_id in run['config_ids']]
-                    all_runs.extend(run_ids)
-        return all_runs
+    def get_previous_runs(self, milestone_id, suite_id, config_id, limit=None):
+        previous_runs = []
+        offset = 0
+
+        while len(previous_runs) < limit:
+            existing_plans = self.get_plans(milestone_ids=[milestone_id],
+                                            limit=limit,
+                                            offset=offset)
+            if not existing_plans:
+                break
+
+            for plan in existing_plans:
+                for entry in self.get_plan(plan['id'])['entries']:
+                    if entry['suite_id'] == suite_id:
+                        run_ids = [run for run in entry['runs'] if
+                                   config_id in run['config_ids']]
+                        previous_runs.extend(run_ids)
+
+            offset += limit
+
+        return previous_runs
 
     def add_run(self, new_run):
         add_run_uri = 'add_run/{project_id}'.format(
@@ -322,14 +365,30 @@ class TestRailProject():
 
     def get_results_for_test(self, test_id, run_results=None):
         if run_results:
-            for results in run_results:
-                if results['test_id'] == test_id:
-                    return results
+            test_results = []
+            for result in run_results:
+                if result['test_id'] == test_id:
+                    test_results.append(result)
+            return test_results
         results_uri = 'get_results/{test_id}'.format(test_id=test_id)
         return self.client.send_get(results_uri)
 
-    def get_results_for_run(self, run_id):
+    def get_results_for_run(self, run_id, created_after=None,
+                            created_before=None, created_by=None, limit=None,
+                            offset=None, status_id=None):
         results_run_uri = 'get_results_for_run/{run_id}'.format(run_id=run_id)
+        if created_after:
+            results_run_uri += '&created_after={}'.format(created_after)
+        if created_before:
+            results_run_uri += '&created_before={}'.format(created_before)
+        if created_by:
+            results_run_uri += '&created_by={}'.format(created_by)
+        if limit:
+            results_run_uri += '&limit={}'.format(limit)
+        if offset:
+            results_run_uri += '&offset={}'.format(offset)
+        if status_id:
+            results_run_uri += '&status_id={}'.format(status_id)
         return self.client.send_get(results_run_uri)
 
     def get_results_for_case(self, run_id, case_id):
@@ -351,14 +410,22 @@ class TestRailProject():
         return all_results
 
     def add_results_for_test(self, test_id, test_results):
-        add_results_test_uri = 'add_result/{test_id}'.format(test_id=test_id)
         new_results = {
             'status_id': self.get_status(test_results.status)['id'],
-            'comment': test_results.url or test_results.description,
+            'comment': '\n'.join(filter(lambda x: x is not None,
+                                        [test_results.description,
+                                         test_results.url,
+                                         test_results.comments])),
             'elapsed': test_results.duration,
             'version': test_results.version
         }
-        return self.client.send_post(add_results_test_uri, new_results)
+        if test_results.steps:
+            new_results['custom_step_results'] = test_results.steps
+        return self.add_raw_results_for_test(test_id, new_results)
+
+    def add_raw_results_for_test(self, test_id, test_raw_results):
+        add_results_test_uri = 'add_result/{test_id}'.format(test_id=test_id)
+        return self.client.send_post(add_results_test_uri, test_raw_results)
 
     def add_results_for_cases(self, run_id, suite_id, tests_results):
         add_results_test_uri = 'add_results_for_cases/{run_id}'.format(
@@ -366,15 +433,47 @@ class TestRailProject():
         new_results = {'results': []}
         tests_cases = self.get_cases(suite_id)
         for results in tests_results:
+            case = self.get_case_by_group(suite_id=suite_id,
+                                          group=results.group,
+                                          cases=tests_cases)
+            case_id = case['id']
             new_result = {
-                'case_id': self.get_case_by_group(suite_id=suite_id,
-                                                  group=results.group,
-                                                  cases=tests_cases)['id'],
+                'case_id': case_id,
                 'status_id': self.get_status(results.status)['id'],
-                'comment': results.url,
+                'comment': '\n'.join(filter(lambda x: x is not None,
+                                            [results.description,
+                                             results.url,
+                                             results.comments])),
                 'elapsed': results.duration,
                 'version': results.version,
                 'custom_launchpad_bug': results.launchpad_bug
             }
+            if results.steps:
+                custom_step_results = []
+                steps = case.get('custom_test_case_steps', None)
+                if steps and len(steps) == len(results.steps):
+                    for s in zip(steps, results.steps):
+                        custom_step_results.append({
+                            "content": s[0]["content"],
+                            "expected": s[0]["expected"],
+                            "actual": s[1]['actual'],
+                            "status_id": self.get_status(s[1]['status'])['id']
+                        })
+                else:
+                    for s in results.steps:
+                        custom_step_results.append({
+                            "content": s['name'],
+                            "expected": 'pass',
+                            "actual": s['actual'],
+                            "status_id": self.get_status(s['status'])['id']
+                        })
+                new_result['custom_test_case_steps_results'] = \
+                    custom_step_results
             new_results['results'].append(new_result)
+        return self.client.send_post(add_results_test_uri, new_results)
+
+    def add_results_for_tempest_cases(self, run_id, tests_results):
+        add_results_test_uri = 'add_results_for_cases/{run_id}'.format(
+            run_id=run_id)
+        new_results = {'results': tests_results}
         return self.client.send_post(add_results_test_uri, new_results)

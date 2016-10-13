@@ -61,6 +61,9 @@ import re
 import sys
 import tarfile
 
+PUPPET_LOG = 'puppet-apply.log'
+ASTUTE_LOG = 'astute.log'
+
 
 class IO(object):
     """
@@ -236,7 +239,7 @@ class IO(object):
         cls.args = parser.parse_args()
         if not cls.args.puppet and not cls.args.astute:
             cls.args.puppet = True
-            cls.args.astute = True
+            cls.args.astute = False
         return cls.args
 
 
@@ -288,7 +291,7 @@ class AbstractLog(object):
 
     def each_record(self):
         """
-        Abstract record iterator that interates
+        Abstract record iterator that iterates
         through the content lines
         :return: iter
         """
@@ -481,7 +484,7 @@ class PuppetLog(AbstractLog):
 
     def parse(self, content):
         """
-        Parse the sting with Puppet log content
+        Parse the string with Puppet log content
         :param content: Puppet log
         :type content: str
         :return:
@@ -508,9 +511,15 @@ class PuppetLog(AbstractLog):
         :return: node name
         :rtype: str
         """
-        match = re.search(r'(node-\d+)', string)
-        if match:
-            return match.group(0)
+        path_elements = string.split('/')
+        try:
+            log_index = path_elements.index(PUPPET_LOG)
+        except ValueError:
+            return None
+        name_index = log_index - 1
+        if name_index < 0:
+            return None
+        return path_elements[name_index]
 
     def output(self):
         """
@@ -520,14 +529,21 @@ class PuppetLog(AbstractLog):
         """
         if self.enable_sort:
             self.sort_log()
+        previous_log = None
         for record in self.log:
             log = record.get('log', None)
+            if log and not self.enable_sort and previous_log != log:
+                IO.output("Log file: '{0}'".format(log))
+                previous_log = log
             time = record.get('time', None)
             line = record.get('line', None)
             if not (log and time and line):
                 continue
-            IO.output("%s %s %s" % (self.node_name(log),
-                                    time.isoformat(), line))
+            IO.output("{name:s} {time:s} {line:s}".format(
+                name=self.node_name(log),
+                time=time.isoformat(),
+                line=line
+            ))
 
     def sort_log(self):
         """
@@ -674,7 +690,7 @@ class FuelSnapshot(object):
         for log in self.snapshot.getmembers():
             if not log.isfile():
                 continue
-            if log.name.endswith('/astute.log'):
+            if log.name.endswith(ASTUTE_LOG):
                 yield log
 
     def puppet_logs(self):
@@ -685,7 +701,7 @@ class FuelSnapshot(object):
         for log in self.snapshot.getmembers():
             if not log.isfile():
                 continue
-            if log.name.endswith('/puppet-apply.log'):
+            if log.name.endswith(PUPPET_LOG):
                 yield log
 
     def parse_log(self, log_file, parser):
@@ -759,7 +775,6 @@ class FuelLogs(object):
             for log_file in files:
                 if log_file == name:
                     path = os.path.join(root, log_file)
-                    IO.output('Processing: %s' % path)
                     yield path
 
     def puppet_logs(self):
@@ -767,14 +782,14 @@ class FuelLogs(object):
         Find the Puppet logs in the log directory
         :return: iter
         """
-        return self.find_logs('puppet-apply.log')
+        return self.find_logs(PUPPET_LOG)
 
     def astute_logs(self):
         """
         Find the Astute logs in the log directory
         :return: iter
         """
-        return self.find_logs('astute.log')
+        return self.find_logs(ASTUTE_LOG)
 
     @staticmethod
     def truncate_log(log_file):

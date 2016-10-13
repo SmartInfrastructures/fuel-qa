@@ -15,27 +15,35 @@
 import traceback
 import os
 import re
-import urllib2
+from xml.etree import ElementTree
 import zlib
 
 from proboscis.asserts import assert_equal
-from xml.etree import ElementTree
+# pylint: disable=import-error
+# noinspection PyUnresolvedReferences
+from six.moves.urllib.request import urlopen
+# noinspection PyUnresolvedReferences
+from six.moves.urllib.error import HTTPError
+# noinspection PyUnresolvedReferences
+from six.moves.urllib.error import URLError
+# pylint: enable=import-error
 
 from fuelweb_test import logger
 from fuelweb_test import settings
-from fuelweb_test.helpers.utils import install_pkg
+from fuelweb_test.helpers.utils import install_pkg_2
+from fuelweb_test.helpers.ssh_manager import SSHManager
 
 
-def regenerate_ubuntu_repo(remote, path):
+def regenerate_ubuntu_repo(path):
     # Ubuntu
-    cr = CustomRepo(remote)
-    cr.install_tools(['dpkg', 'dpkg-devel'])
+    cr = CustomRepo()
+    cr.install_tools(['dpkg', 'dpkg-devel', 'dpkg-dev'])
     cr.regenerate_repo('regenerate_ubuntu_repo', path)
 
 
-def regenerate_centos_repo(remote, path):
+def regenerate_centos_repo(path):
     # CentOS
-    cr = CustomRepo(remote)
+    cr = CustomRepo()
     cr.install_tools(['createrepo'])
     cr.regenerate_repo('regenerate_centos_repo', path)
 
@@ -43,8 +51,9 @@ def regenerate_centos_repo(remote, path):
 class CustomRepo(object):
     """CustomRepo."""  # TODO documentation
 
-    def __init__(self, remote):
-        self.remote = remote
+    def __init__(self):
+        self.ssh_manager = SSHManager()
+        self.ip = self.ssh_manager.admin_ip
         self.path_scripts = ('{0}/fuelweb_test/helpers/'
                              .format(os.environ.get("WORKSPACE", "./")))
         self.remote_path_scripts = '/tmp/'
@@ -53,10 +62,6 @@ class CustomRepo(object):
         self.local_mirror_ubuntu = settings.LOCAL_MIRROR_UBUNTU
         self.local_mirror_centos = settings.LOCAL_MIRROR_CENTOS
         self.ubuntu_release = settings.UBUNTU_RELEASE
-        self.ubuntu_yaml_versions = ('/etc/puppet/manifests/'
-                                     'ubuntu-versions.yaml')
-        self.centos_yaml_versions = ('/etc/puppet/manifests/'
-                                     'centos-versions.yaml')
         self.centos_supported_archs = ['noarch', 'x86_64']
         self.pkgs_list = []
 
@@ -78,7 +83,7 @@ class CustomRepo(object):
         Scenario:
             1. Temporary set nameserver to local router on admin node
             2. Install tools to manage rpm/deb repository
-            3. Retrive list of packages from custom repository
+            3. Retrieve list of packages from custom repository
             4. Download packages to local rpm/deb repository
             5. Update .yaml file with new packages version
             6. Re-generate repo using shell scripts on admin node
@@ -92,13 +97,12 @@ class CustomRepo(object):
 
         if settings.OPENSTACK_RELEASE_UBUNTU in settings.OPENSTACK_RELEASE:
             # Ubuntu
-            master_tools = ['dpkg', 'dpkg-devel']
+            master_tools = ['dpkg', 'dpkg-devel', 'dpkg-dev']
             self.install_tools(master_tools)
             self.get_pkgs_list_ubuntu()
             pkgs_local_path = ('{0}/pool/'
                                .format(self.local_mirror_ubuntu))
             self.download_pkgs(pkgs_local_path)
-            self.update_yaml(self.ubuntu_yaml_versions)
             self.regenerate_repo(self.ubuntu_script, self.local_mirror_ubuntu)
         else:
             # CentOS
@@ -107,15 +111,19 @@ class CustomRepo(object):
             self.get_pkgs_list_centos()
             pkgs_local_path = '{0}/Packages/'.format(self.local_mirror_centos)
             self.download_pkgs(pkgs_local_path)
-            self.update_yaml(self.centos_yaml_versions)
             self.regenerate_repo(self.centos_script, self.local_mirror_centos)
 
     # Install tools to masternode
-    def install_tools(self, master_tools=[]):
+    def install_tools(self, master_tools=None):
+        if master_tools is None:
+            master_tools = []
         logger.info("Installing necessary tools for {0}"
                     .format(settings.OPENSTACK_RELEASE))
         for master_tool in master_tools:
-            exit_code = install_pkg(self.remote, master_tool)
+            exit_code = install_pkg_2(
+                ip=self.ip,
+                pkg_name=master_tool
+            )
             assert_equal(0, exit_code, 'Cannot install package {0} '
                          'on admin node.'.format(master_tool))
 
@@ -123,18 +131,19 @@ class CustomRepo(object):
     def get_pkgs_list_ubuntu(self):
         url = "{0}/{1}/Packages".format(self.custom_pkgs_mirror,
                                         self.custom_pkgs_mirror_path)
-        logger.info("Retriving additional packages from the custom mirror:"
+        logger.info("Retrieving additional packages from the custom mirror:"
                     " {0}".format(url))
         try:
-            pkgs_release = urllib2.urlopen(url).read()
-        except (urllib2.HTTPError, urllib2.URLError):
+            pkgs_release = urlopen(url).read()
+        except (HTTPError, URLError):
             logger.error(traceback.format_exc())
             url_gz = '{0}.gz'.format(url)
-            logger.info("Retriving additional packages from the custom mirror:"
-                        " {0}".format(url_gz))
+            logger.info(
+                "Retrieving additional packages from the custom mirror:"
+                " {0}".format(url_gz))
             try:
-                pkgs_release_gz = urllib2.urlopen(url_gz).read()
-            except (urllib2.HTTPError, urllib2.URLError):
+                pkgs_release_gz = urlopen(url_gz).read()
+            except (HTTPError, URLError):
                 logger.error(traceback.format_exc())
                 raise
             try:
@@ -154,17 +163,17 @@ class CustomRepo(object):
             assert_equal(True, all(x in upkg for x in upkg_keys),
                          'Missing one of the statements ["Package:", '
                          '"Version:", "Filename:"] in {0}'.format(url))
-            # TODO: add dependences list to upkg
+            # TODO: add dependencies list to upkg
             self.pkgs_list.append(upkg)
 
     # Centos: Creating list of packages from the additional mirror
     def get_pkgs_list_centos(self):
-        logger.info("Retriving additional packages from the custom mirror: {0}"
-                    .format(self.custom_pkgs_mirror))
+        logger.info("Retrieving additional packages from the custom mirror:"
+                    " {0}".format(self.custom_pkgs_mirror))
         url = "{0}/repodata/repomd.xml".format(self.custom_pkgs_mirror)
         try:
-            repomd_data = urllib2.urlopen(url).read()
-        except (urllib2.HTTPError, urllib2.URLError):
+            repomd_data = urlopen(url).read()
+        except (HTTPError, URLError):
             logger.error(traceback.format_exc())
             raise
         # Remove namespace attribute before parsing XML
@@ -181,8 +190,8 @@ class CustomRepo(object):
                      .format(url, lists_location, traceback.format_exc()))
         url = "{0}/{1}".format(self.custom_pkgs_mirror, lists_location)
         try:
-            lists_data = urllib2.urlopen(url).read()
-        except (urllib2.HTTPError, urllib2.URLError):
+            lists_data = urlopen(url).read()
+        except (HTTPError, URLError):
             logger.error(traceback.format_exc())
             raise
         if '.xml.gz' in lists_location:
@@ -212,7 +221,7 @@ class CustomRepo(object):
                     cpkg = {'package:': flist_name,
                             'version:': flist_ver,
                             'filename:': flist_file}
-                    # TODO: add dependences list to cpkg
+                    # TODO: add dependencies list to cpkg
                     self.pkgs_list.append(cpkg)
 
     # Download packages (local_folder)
@@ -223,7 +232,7 @@ class CustomRepo(object):
 
         for npkg, pkg in enumerate(self.pkgs_list):
             # TODO: Previous versions of the updating packages must be removed
-            # to avoid unwanted packet manager dependences resolution
+            # to avoid unwanted packet manager dependencies resolution
             # (when some package still depends on other package which
             # is not going to be installed)
 
@@ -244,70 +253,55 @@ class CustomRepo(object):
                        .format(pkgs_local_path + path_suff,
                                self.custom_pkgs_mirror,
                                pkg["filename:"])
-            wget_result = self.remote.execute(wget_cmd)
+            wget_result = self.ssh_manager.execute(
+                ip=self.ip,
+                cmd=wget_cmd
+            )
             assert_equal(0, wget_result['exit_code'],
                          self.assert_msg(wget_cmd, wget_result['stderr']))
-
-    # Update yaml (pacth_to_yaml)
-    def update_yaml(self, yaml_versions):
-            # Update the corresponding .yaml with the new package version.
-        for pkg in self.pkgs_list:
-            result = self.remote.execute(
-                'grep -e "^{0}: " {1}'.format(pkg["package:"], yaml_versions))
-            if result['exit_code'] == 0:
-                sed_cmd = ('sed -i \'s/^{0}: .*/{0}: "{1}"/\' {2}'
-                           .format(pkg["package:"],
-                                   pkg["version:"],
-                                   yaml_versions))
-                sed_result = self.remote.execute(sed_cmd)
-                assert_equal(0, sed_result['exit_code'],
-                             self.assert_msg(sed_cmd, sed_result['stderr']))
-            else:
-                assert_equal(1, result['exit_code'], 'Error updating {0}\n{1}'
-                             .format(yaml_versions, traceback.format_exc()))
-                echo_cmd = ('echo "{0}: \\"{1}\\"" >> {2}'
-                            .format(pkg["package:"],
-                                    pkg["version:"],
-                                    yaml_versions))
-                echo_result = self.remote.execute(echo_cmd)
-                assert_equal(0, echo_result['exit_code'],
-                             self.assert_msg(echo_cmd,
-                                             echo_result['stderr']))
 
     # Upload regenerate* script to masternode (script name)
     def regenerate_repo(self, regenerate_script, local_mirror_path):
         # Uploading scripts that prepare local repositories:
         # 'regenerate_centos_repo' and 'regenerate_ubuntu_repo'
         try:
-            self.remote.upload('{0}/{1}'.format(self.path_scripts,
-                                                regenerate_script),
-                               self.remote_path_scripts)
-            self.remote.execute('chmod 755 {0}/{1}'
-                                .format(self.remote_path_scripts,
-                                        regenerate_script))
+            self.ssh_manager.upload_to_remote(
+                ip=self.ip,
+                source='{0}/{1}'.format(self.path_scripts, regenerate_script),
+                target=self.remote_path_scripts
+            )
+            self.ssh_manager.execute_on_remote(
+                ip=self.ip,
+                cmd='chmod 755 {0}/{1}'.format(self.remote_path_scripts,
+                                               regenerate_script)
+            )
         except Exception:
             logger.error('Could not upload scripts for updating repositories.'
                          '\n{0}'.format(traceback.format_exc()))
             raise
 
-        # Update the local repository using prevously uploaded script.
+        # Update the local repository using previously uploaded script.
         script_cmd = '{0}/{1} {2} {3}'.format(self.remote_path_scripts,
                                               regenerate_script,
                                               local_mirror_path,
                                               self.ubuntu_release)
-        script_result = self.remote.execute(script_cmd)
+        script_result = self.ssh_manager.execute(
+            ip=self.ip,
+            cmd=script_cmd
+        )
         assert_equal(0, script_result['exit_code'],
                      self.assert_msg(script_cmd, script_result['stderr']))
 
-        logger.info('Local repository {0} has been updated successfuly.'
+        logger.info('Local repository {0} has been updated successfully.'
                     .format(local_mirror_path))
 
-    def assert_msg(self, cmd, err):
+    @staticmethod
+    def assert_msg(cmd, err):
         return 'Executing \'{0}\' on the admin node has failed with: {1}'\
                .format(cmd, err)
 
     def check_puppet_logs(self):
-        logger.info("Check puppet logs for packages with unmet dependences.")
+        logger.info("Check puppet logs for packages with unmet dependencies.")
         if settings.OPENSTACK_RELEASE_UBUNTU in settings.OPENSTACK_RELEASE:
             err_deps = self.check_puppet_logs_ubuntu()
         else:
@@ -328,9 +322,12 @@ class CustomRepo(object):
         err_end = ('Unable to correct problems,'
                    ' you have held broken packages.')
         cmd = ('fgrep -h -e " Depends: " -e "{0}" -e "{1}" '
-               '/var/log/docker-logs/remote/node-*/'
+               '/var/log/remote/node-*/'
                'puppet*.log'.format(err_start, err_end))
-        result = self.remote.execute(cmd)['stdout']
+        result = self.ssh_manager.execute(
+            ip=self.ip,
+            cmd=cmd
+        )['stdout']
 
         err_deps = {}
         err_deps_key = ''
@@ -366,8 +363,11 @@ class CustomRepo(object):
             dependency errors during a cluster deployment (centos)"""
 
         cmd = ('fgrep -h -e "Error: Package: " -e " Requires: " /var/log/'
-               'docker-logs/remote/node-*/puppet*.log')
-        result = self.remote.execute(cmd)['stdout']
+               'remote/node-*/puppet*.log')
+        result = self.ssh_manager.execute(
+            ip=self.ip,
+            cmd=cmd
+        )['stdout']
 
         err_deps = {}
         err_deps_key = ''
@@ -380,7 +380,7 @@ class CustomRepo(object):
                 if err_deps_key not in err_deps:
                     err_deps[err_deps_key] = set()
             elif ' Requires: ' in res_str and err_deps_key:
-                str0, str1, str2 = res_str.partition(' Requires: ')
+                _, str1, str2 = res_str.partition(' Requires: ')
                 err_deps[err_deps_key].add(str1 + str2)
             else:
                 err_deps_key = ''

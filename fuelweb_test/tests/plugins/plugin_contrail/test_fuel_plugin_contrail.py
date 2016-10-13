@@ -12,6 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from __future__ import division
+
 import os
 import os.path
 import time
@@ -19,14 +21,17 @@ import time
 from proboscis import test
 from proboscis.asserts import assert_true
 
+from fuelweb_test.helpers.checkers import check_plugin_path_env
 from fuelweb_test.helpers.decorators import log_snapshot_after_test
-from fuelweb_test.helpers import checkers
+from fuelweb_test.helpers import utils
 from fuelweb_test.helpers.common import Common
 from fuelweb_test import logger
 from fuelweb_test.settings import DEPLOYMENT_MODE
 from fuelweb_test.settings import CONTRAIL_PLUGIN_PATH
 from fuelweb_test.settings import CONTRAIL_PLUGIN_PACK_UB_PATH
 from fuelweb_test.settings import CONTRAIL_PLUGIN_PACK_CEN_PATH
+from fuelweb_test.settings import NEUTRON_SEGMENT
+from fuelweb_test.settings import iface_alias
 from fuelweb_test.tests.base_test_case import SetupEnvironment
 from fuelweb_test.tests.base_test_case import TestBasic
 
@@ -48,14 +53,28 @@ class ContrailPlugin(TestBasic):
 
     _pack_path = [CONTRAIL_PLUGIN_PACK_UB_PATH, CONTRAIL_PLUGIN_PACK_CEN_PATH]
 
-    def _upload_contrail_packages(self):
+    def __init__(self):
+        super(ContrailPlugin, self).__init__()
+        check_plugin_path_env(
+            var_name='CONTRAIL_PLUGIN_PATH',
+            plugin_path=CONTRAIL_PLUGIN_PATH
+        )
+        check_plugin_path_env(
+            var_name='CONTRAIL_PLUGIN_PACK_UB_PATH',
+            plugin_path=CONTRAIL_PLUGIN_PACK_UB_PATH
+        )
+        check_plugin_path_env(
+            var_name='CONTRAIL_PLUGIN_PACK_CEN_PATH',
+            plugin_path=CONTRAIL_PLUGIN_PACK_CEN_PATH
+        )
+
+    def _upload_contrail_packages(self, remote):
         for pack in self._pack_path:
-            node_ssh = self.env.d_env.get_admin_remote()
             if os.path.splitext(pack)[1] in [".deb", ".rpm"]:
                 pkg_name = os.path.basename(pack)
                 logger.debug("Uploading package {0} "
                              "to master node".format(pkg_name))
-                node_ssh.upload(pack, self._pack_copy_path)
+                remote.upload(pack, self._pack_copy_path)
             else:
                 logger.error('Failed to upload file')
 
@@ -68,7 +87,7 @@ class ContrailPlugin(TestBasic):
 
     def _assign_net_provider(self, pub_all_nodes=False):
         """Assign neutron with  vlan segmentation"""
-        segment_type = 'vlan'
+        segment_type = NEUTRON_SEGMENT['vlan']
         self.cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
             mode=DEPLOYMENT_MODE,
@@ -83,23 +102,27 @@ class ContrailPlugin(TestBasic):
     def _prepare_contrail_plugin(self, slaves=None, pub_net=False):
         """Copy necessary packages to the master node and install them"""
 
-        self.env.revert_snapshot("ready_with_%d_slaves" % slaves)
+        self.env.revert_snapshot("ready_with_{:d}_slaves".format(slaves))
 
-        # copy plugin to the master node
-        checkers.upload_tarball(
-            self.env.d_env.get_admin_remote(),
-            CONTRAIL_PLUGIN_PATH, '/var')
+        with self.env.d_env.get_admin_remote() as remote:
 
-        # install plugin
-        checkers.install_plugin_check_code(
-            self.env.d_env.get_admin_remote(),
-            plugin=os.path.basename(CONTRAIL_PLUGIN_PATH))
+            # copy plugin to the master node
+            utils.upload_tarball(
+                ip=self.ssh_manager.admin_ip,
+                tar_path=CONTRAIL_PLUGIN_PATH,
+                tar_target='/var'
+            )
 
-        # copy additional packages to the master node
-        self._upload_contrail_packages()
+            # install plugin
+            utils.install_plugin_check_code(
+                ip=self.ssh_manager.admin_ip,
+                plugin=os.path.basename(CONTRAIL_PLUGIN_PATH))
 
-        # install packages
-        self._install_packages(self.env.d_env.get_admin_remote())
+            # copy additional packages to the master node
+            self._upload_contrail_packages(remote)
+
+            # install packages
+            self._install_packages(remote)
 
         # prepare fuel
         self._assign_net_provider(pub_net)
@@ -158,7 +181,9 @@ class ContrailPlugin(TestBasic):
         nailgun_nodes = \
             self.fuel_web.client.list_cluster_nodes(self.cluster_id)
         base_os_disk = 40960
+        # pylint:  disable=round-builtin
         base_os_disk_gb = ("{0}G".format(round(base_os_disk / 1024, 1)))
+        # pylint:  enable=round-builtin
         logger.info('disk size is {0}'.format(base_os_disk_gb))
         disk_part = {
             "vda": {
@@ -216,7 +241,11 @@ class ContrailPlugin(TestBasic):
                 'slave-03': ['base-os'],
                 'slave-04': ['controller'],
             },
-            contrail=True
+            custom_names={
+                'slave-01': 'contrail-1',
+                'slave-02': 'contrail-2',
+                'slave-03': 'contrail-3'
+            }
         )
 
         # configure disks on base-os nodes
@@ -258,9 +287,13 @@ class ContrailPlugin(TestBasic):
                 'slave-02': ['base-os'],
                 'slave-03': ['base-os'],
                 'slave-04': ['controller'],
-                'slave-05': ['compute', 'cinder'],
+                'slave-05': ['compute', 'cinder']
             },
-            contrail=True
+            custom_names={
+                'slave-01': 'contrail-1',
+                'slave-02': 'contrail-2',
+                'slave-03': 'contrail-3'
+            }
         )
 
         # configure disks on base-os nodes
@@ -288,7 +321,7 @@ class ContrailPlugin(TestBasic):
             should_fail=2,
             failed_test_name=[('Check network connectivity '
                                'from instance via floating IP'),
-                              ('Launch instance with file injection')]
+                              'Launch instance with file injection']
         )
 
         logger.info(self._ostf_msg)
@@ -331,9 +364,13 @@ class ContrailPlugin(TestBasic):
                 'slave-03': ['base-os'],
                 'slave-04': ['controller'],
                 'slave-05': ['compute'],
-                'slave-06': ['compute'],
+                'slave-06': ['compute']
             },
-            contrail=True
+            custom_names={
+                'slave-01': 'contrail-1',
+                'slave-02': 'contrail-2',
+                'slave-03': 'contrail-3'
+            }
         )
 
         # configure disks on base-os nodes
@@ -374,11 +411,10 @@ class ContrailPlugin(TestBasic):
 
         self.fuel_web.run_ostf(
             cluster_id=self.cluster_id,
-            should_fail=3,
+            should_fail=2,
             failed_test_name=[('Check network connectivity '
                                'from instance via floating IP'),
-                              ('Launch instance with file injection'),
-                              ('Check that required services are running')]
+                              'Launch instance with file injection']
         )
 
         logger.info(self._ostf_msg)
@@ -417,9 +453,13 @@ class ContrailPlugin(TestBasic):
                 'slave-01': ['base-os'],
                 'slave-02': ['base-os'],
                 'slave-03': ['base-os'],
-                'slave-04': ['controller'],
+                'slave-04': ['controller']
             },
-            contrail=True
+            custom_names={
+                'slave-01': 'contrail-1',
+                'slave-02': 'contrail-2',
+                'slave-03': 'contrail-3'
+            }
         )
 
         # configure disks on base-os nodes
@@ -452,7 +492,7 @@ class ContrailPlugin(TestBasic):
             should_fail=2,
             failed_test_name=[('Check network connectivity '
                                'from instance via floating IP'),
-                              ('Launch instance with file injection')]
+                              'Launch instance with file injection']
         )
 
         logger.info(self._ostf_msg)
@@ -472,7 +512,7 @@ class ContrailPlugin(TestBasic):
 
         self.fuel_web.deploy_cluster_wait(self.cluster_id)
 
-        #TODO
+        # TODO:
         # Tests using north-south connectivity are expected to fail because
         # they require additional gateway nodes, and specific contrail
         # settings. This mark is a workaround until it's verified
@@ -485,7 +525,7 @@ class ContrailPlugin(TestBasic):
             should_fail=2,
             failed_test_name=[('Check network connectivity '
                                'from instance via floating IP'),
-                              ('Launch instance with file injection')]
+                              'Launch instance with file injection']
         )
 
     @test(depends_on=[SetupEnvironment.prepare_slaves_9],
@@ -526,7 +566,11 @@ class ContrailPlugin(TestBasic):
                 'slave-06': ['controller'],
                 'slave-07': ['compute']
             },
-            contrail=True
+            custom_names={
+                'slave-01': 'contrail-1',
+                'slave-02': 'contrail-2',
+                'slave-03': 'contrail-3'
+            }
         )
 
         # configure disks on base-os nodes
@@ -569,11 +613,10 @@ class ContrailPlugin(TestBasic):
 
         self.fuel_web.run_ostf(
             cluster_id=self.cluster_id,
-            should_fail=3,
+            should_fail=2,
             failed_test_name=[('Check network connectivity '
                                'from instance via floating IP'),
-                              ('Launch instance with file injection'),
-                              ('Check that required services are running')]
+                              'Launch instance with file injection']
         )
 
         logger.info(self._ostf_msg)
@@ -614,7 +657,11 @@ class ContrailPlugin(TestBasic):
                 'slave-04': ['controller'],
                 'slave-05': ['compute'],
             },
-            contrail=True
+            custom_names={
+                'slave-01': 'contrail-1',
+                'slave-02': 'contrail-2',
+                'slave-03': 'contrail-3'
+            }
         )
 
         # configure disks on base-os nodes
@@ -650,7 +697,7 @@ class ContrailPlugin(TestBasic):
             should_fail=2,
             failed_test_name=[('Check network connectivity '
                                'from instance via floating IP'),
-                              ('Launch instance with file injection')])
+                              'Launch instance with file injection'])
 
     @test(depends_on=[SetupEnvironment.prepare_slaves_5],
           groups=["check_bonding_with_contrail"])
@@ -682,17 +729,21 @@ class ContrailPlugin(TestBasic):
                 'slave-02': ['base-os'],
                 'slave-03': ['base-os'],
                 'slave-04': ['controller'],
-                'slave-05': ['compute'],
+                'slave-05': ['compute']
             },
-            contrail=True
+            custom_names={
+                'slave-01': 'contrail-1',
+                'slave-02': 'contrail-2',
+                'slave-03': 'contrail-3'
+            }
         )
         raw_data = [{
             'mac': None,
             'mode': 'active-backup',
-            'name': 'lnx-bond0',
+            'name': 'bond0',
             'slaves': [
-                {'name': 'eth4'},
-                {'name': 'eth2'},
+                {'name': iface_alias('eth4')},
+                {'name': iface_alias('eth2')},
             ],
             'state': None,
             'type': 'bond',
@@ -700,10 +751,10 @@ class ContrailPlugin(TestBasic):
         }, ]
 
         interfaces = {
-            'eth0': ['fuelweb_admin'],
-            'eth1': ['public'],
-            'eth3': ['private'],
-            'lnx-bond0': [
+            iface_alias('eth0'): ['fuelweb_admin'],
+            iface_alias('eth1'): ['public'],
+            iface_alias('eth3'): ['private'],
+            'bond0': [
                 'management',
                 'storage',
             ]
@@ -737,9 +788,8 @@ class ContrailPlugin(TestBasic):
 
         self.fuel_web.run_ostf(
             cluster_id=self.cluster_id,
-            should_fail=3,
+            should_fail=2,
             failed_test_name=[('Check network connectivity '
                                'from instance via floating IP'),
-                              ('Launch instance with file injection'),
-                              ('Check that required services are running')]
+                              'Launch instance with file injection']
         )

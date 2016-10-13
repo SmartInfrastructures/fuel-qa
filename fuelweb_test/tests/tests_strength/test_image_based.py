@@ -17,6 +17,7 @@ from proboscis import test
 
 from fuelweb_test.helpers.decorators import log_snapshot_after_test
 from fuelweb_test.settings import DEPLOYMENT_MODE
+from fuelweb_test.settings import NEUTRON_SEGMENT
 from fuelweb_test.tests.base_test_case import SetupEnvironment
 from fuelweb_test.tests.base_test_case import TestBasic
 
@@ -36,9 +37,10 @@ class RepeatableImageBased(TestBasic):
             2. Add 1 controller, 2 compute and 2 cinder nodes
             3. Deploy the cluster
             4. Delete cluster
-            5. Create another HA cluster
-            6. Create snapshot of environment
-            7. Revert snapshot and try provision cluster 10 times
+            5. Create snapshot of environment
+            6. Revert snapshot
+            7. Create and try provision another HA cluster
+            8. Repeat 6-7 steps 10 times
 
         Duration 60m
 
@@ -49,7 +51,7 @@ class RepeatableImageBased(TestBasic):
             mode=DEPLOYMENT_MODE,
             settings={
                 "net_provider": 'neutron',
-                "net_segment_type": 'gre'})
+                "net_segment_type": NEUTRON_SEGMENT['tun']})
         self.fuel_web.update_nodes(
             cluster_id,
             {
@@ -63,15 +65,19 @@ class RepeatableImageBased(TestBasic):
         self.fuel_web.deploy_cluster_wait(cluster_id)
         self.fuel_web.client.delete_cluster(cluster_id)
         # wait nodes go to reboot
-        wait(lambda: not self.fuel_web.client.list_nodes(), timeout=10 * 60)
+        wait(lambda: not self.fuel_web.client.list_nodes(),
+             timeout=10 * 60,
+             timeout_msg='Nodes failed to become offline')
         # wait for nodes to appear after bootstrap
         wait(lambda: len(self.fuel_web.client.list_nodes()) == 5,
-             timeout=10 * 60)
-        self.fuel_web.warm_shutdown_nodes(self.env.d_env.nodes().slaves[:5])
+             timeout=10 * 60,
+             timeout_msg='Nodes failed to become online')
+        for slave in self.env.d_env.nodes().slaves[:5]:
+            slave.destroy()
 
         self.env.make_snapshot("deploy_after_delete", is_make=True)
 
-        for i in range(0, 10):
+        for _ in range(10):
             self.env.revert_snapshot("deploy_after_delete")
             for node in self.env.d_env.nodes().slaves[:5]:
                 node.start()

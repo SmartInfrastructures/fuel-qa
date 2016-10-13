@@ -18,6 +18,11 @@ Report
 .. automodule:: fuelweb_test.testrail.report
    :members:
 
+Report partner ingreation
+-------------------------
+.. automodule:: fuelweb_test.testrail.report_pi
+   :members:
+
 Report tempest results
 ----------------------
 .. automodule:: fuelweb_test.testrail.report_tempest_results
@@ -46,4 +51,19 @@ Upload Cases Description
 Upload tempest test suite
 -------------------------
 .. automodule:: fuelweb_test.testrail.upload_tempest_test_suite
+   :members:
+
+Generate bugs statistics for TestPlan
+-------------------------------------
+.. automodule:: fuelweb_test.testrail.generate_statistics
+   :members:
+
+Datetime utils for Testrail
+---------------------------
+.. automodule:: fuelweb_test.testrail.datetime_util
+   :members:
+
+Generate failure statistics for TestPlan
+----------------------------------------
+.. automodule:: fuelweb_test.testrail.generate_failure_group_statistics
    :members:

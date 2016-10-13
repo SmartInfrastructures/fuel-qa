@@ -12,66 +12,124 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from __future__ import division
+
+import logging
 import re
 import time
 import traceback
-import yaml
 
+import distutils
+import devops
 from devops.error import DevopsCalledProcessError
 from devops.error import TimeoutError
-from devops.helpers.helpers import _wait
+from devops.helpers.helpers import wait_pass
 from devops.helpers.helpers import wait
-from ipaddr import IPNetwork
+from devops.models.node import Node
+try:
+    from devops.error import DevopsObjNotFound
+except ImportError:
+    # pylint: disable=no-member
+    DevopsObjNotFound = Node.DoesNotExist
+    # pylint: enable=no-member
+from keystoneauth1 import exceptions
+from keystoneauth1.identity import V2Password
+from keystoneauth1.session import Session as KeystoneSession
+import netaddr
+import six
 from proboscis.asserts import assert_equal
 from proboscis.asserts import assert_false
 from proboscis.asserts import assert_is_not_none
+from proboscis.asserts import assert_not_equal
+from proboscis.asserts import assert_raises
 from proboscis.asserts import assert_true
+import yaml
 
+from core.helpers.log_helpers import logwrap
+from core.helpers.log_helpers import QuietLogger
+from core.models.fuel_client import Client as FuelClient
+
+from fuelweb_test import logger
+from fuelweb_test import ostf_test_mapping
 from fuelweb_test.helpers import ceph
 from fuelweb_test.helpers import checkers
-from fuelweb_test import logwrap
-from fuelweb_test import logger
-from fuelweb_test import quiet_logger
-from fuelweb_test.helpers.decorators import custom_repo
+from fuelweb_test.helpers import replace_repos
 from fuelweb_test.helpers.decorators import check_repos_management
+from fuelweb_test.helpers.decorators import custom_repo
 from fuelweb_test.helpers.decorators import download_astute_yaml
 from fuelweb_test.helpers.decorators import download_packages_json
 from fuelweb_test.helpers.decorators import duration
 from fuelweb_test.helpers.decorators import retry
-from fuelweb_test.helpers.decorators import update_ostf
 from fuelweb_test.helpers.decorators import update_fuel
 from fuelweb_test.helpers.decorators import upload_manifests
 from fuelweb_test.helpers.security import SecurityChecks
+from fuelweb_test.helpers.ssh_manager import SSHManager
+from fuelweb_test.helpers.ssl_helpers import change_cluster_ssl_config
+from fuelweb_test.helpers.ssl_helpers import copy_cert_from_master
+from fuelweb_test.helpers.uca import change_cluster_uca_config
+from fuelweb_test.helpers.utils import get_node_hiera_roles
+from fuelweb_test.helpers.utils import node_freemem
+from fuelweb_test.helpers.utils import pretty_log
 from fuelweb_test.models.nailgun_client import NailgunClient
-from fuelweb_test import ostf_test_mapping as map_ostf
+import fuelweb_test.settings as help_data
 from fuelweb_test.settings import ATTEMPTS
 from fuelweb_test.settings import BONDING
-from fuelweb_test.settings import DNS_SUFFIX
-from fuelweb_test.settings import DEPLOYMENT_MODE_SIMPLE
 from fuelweb_test.settings import DEPLOYMENT_MODE_HA
+from fuelweb_test.settings import DISABLE_SSL
+from fuelweb_test.settings import DNS_SUFFIX
+from fuelweb_test.settings import iface_alias
+from fuelweb_test.settings import KEYSTONE_CREDS
 from fuelweb_test.settings import KVM_USE
 from fuelweb_test.settings import MULTIPLE_NETWORKS
+from fuelweb_test.settings import NOVA_QUOTAS_ENABLED
+from fuelweb_test.settings import NETWORK_PROVIDERS
 from fuelweb_test.settings import NEUTRON
 from fuelweb_test.settings import NEUTRON_SEGMENT
+from fuelweb_test.settings import NEUTRON_SEGMENT_TYPE
 from fuelweb_test.settings import NODEGROUPS
 from fuelweb_test.settings import OPENSTACK_RELEASE
 from fuelweb_test.settings import OPENSTACK_RELEASE_UBUNTU
 from fuelweb_test.settings import OSTF_TEST_NAME
 from fuelweb_test.settings import OSTF_TEST_RETRIES_COUNT
+from fuelweb_test.settings import REPLACE_DEFAULT_REPOS
+from fuelweb_test.settings import REPLACE_DEFAULT_REPOS_ONLY_ONCE
+from fuelweb_test.settings import SSL_CN
 from fuelweb_test.settings import TIMEOUT
+from fuelweb_test.settings import UCA_ENABLED
+from fuelweb_test.settings import USER_OWNED_CERT
+from fuelweb_test.settings import VCENTER_DATACENTER
+from fuelweb_test.settings import VCENTER_DATASTORE
+from fuelweb_test.settings import VCENTER_IP
+from fuelweb_test.settings import VCENTER_PASSWORD
+from fuelweb_test.settings import VCENTER_USERNAME
+from fuelweb_test.settings import UBUNTU_SERVICE_PROVIDER
 
-import fuelweb_test.settings as help_data
 
-
-class FuelWebClient(object):
+class FuelWebClient29(object):
     """FuelWebClient."""  # TODO documentation
 
-    def __init__(self, admin_node_ip, environment):
-        self.admin_node_ip = admin_node_ip
-        self.client = NailgunClient(admin_node_ip)
+    def __init__(self, environment):
+        self.ssh_manager = SSHManager()
+        self.admin_node_ip = self.ssh_manager.admin_ip
         self._environment = environment
+
+        keystone_url = "http://{0}:5000/v2.0".format(self.admin_node_ip)
+
+        auth = V2Password(
+            auth_url=keystone_url,
+            username=KEYSTONE_CREDS['username'],
+            password=KEYSTONE_CREDS['password'],
+            tenant_name=KEYSTONE_CREDS['tenant_name'])
+        # TODO: in v3 project_name
+
+        self._session = KeystoneSession(auth=auth, verify=False)
+
+        self.client = NailgunClient(session=self._session)
+        self.fuel_client = FuelClient(session=self._session)
+
         self.security = SecurityChecks(self.client, self._environment)
-        super(FuelWebClient, self).__init__()
+
+        super(FuelWebClient29, self).__init__()
 
     @property
     def environment(self):
@@ -82,7 +140,7 @@ class FuelWebClient(object):
 
     @staticmethod
     @logwrap
-    def get_cluster_status(os_conn, smiles_count, networks_count=1):
+    def get_cluster_status(os_conn, smiles_count, networks_count=2):
         checkers.verify_service_list_api(os_conn, service_count=smiles_count)
         checkers.verify_glance_image_api(os_conn)
         checkers.verify_network_list_api(os_conn, networks_count)
@@ -92,11 +150,15 @@ class FuelWebClient(object):
         logger.info('Wait OSTF tests at cluster #%s for %s seconds',
                     cluster_id, timeout)
         wait(
-            lambda: all([run['status'] == 'finished'
-                         for run in
-                         self.client.get_ostf_test_run(cluster_id)]),
-            timeout=timeout)
-        return self.client.get_ostf_test_run(cluster_id)
+            lambda: all(
+                [
+                    run['status'] == 'finished' for run
+                    in self.fuel_client.ostf.get_test_runs(
+                        cluster_id=cluster_id)]),
+            timeout=timeout,
+            timeout_msg='OSTF tests run timeout '
+                        '(cluster_id={})'.format(cluster_id))
+        return self.fuel_client.ostf.get_test_runs(cluster_id=cluster_id)
 
     @logwrap
     def _tasks_wait(self, tasks, timeout):
@@ -109,18 +171,19 @@ class FuelWebClient(object):
         self.client.add_syslog_server(cluster_id, host, port)
 
     @logwrap
-    def assert_cluster_floating_list(self, node_name, expected_ips):
-        logger.info('Assert floating IPs at node %s. Expected %s',
-                    node_name, expected_ips)
-        current_ips = self.get_cluster_floating_list(node_name)
+    def assert_cluster_floating_list(self, os_conn, cluster_id, expected_ips):
+        logger.info('Assert floating IPs on cluster #{0}. Expected {1}'.format(
+            cluster_id, expected_ips))
+        current_ips = self.get_cluster_floating_list(os_conn, cluster_id)
         assert_equal(set(expected_ips), set(current_ips),
                      'Current floating IPs {0}'.format(current_ips))
 
     @logwrap
     def assert_cluster_ready(self, os_conn, smiles_count,
-                             networks_count=1, timeout=300):
+                             networks_count=2, timeout=300):
         logger.info('Assert cluster services are UP')
-        _wait(
+        # TODO(astudenov): add timeout_msg
+        wait_pass(
             lambda: self.get_cluster_status(
                 os_conn,
                 smiles_count=smiles_count,
@@ -135,11 +198,12 @@ class FuelWebClient(object):
         if self.get_cluster_mode(cluster_id) == DEPLOYMENT_MODE_HA:
             logger.info('Waiting {0} sec. for passed OSTF HA tests.'
                         .format(timeout))
-            with quiet_logger():
-                _wait(lambda: self.run_ostf(cluster_id,
-                                            test_sets=['ha'],
-                                            should_fail=should_fail),
-                      interval=20, timeout=timeout)
+            with QuietLogger(logging.ERROR):
+                # TODO(astudenov): add timeout_msg
+                wait_pass(lambda: self.run_ostf(cluster_id,
+                                                test_sets=['ha'],
+                                                should_fail=should_fail),
+                          interval=20, timeout=timeout)
             logger.info('OSTF HA tests passed successfully.')
         else:
             logger.debug('Cluster {0} is not in HA mode, OSTF HA tests '
@@ -152,11 +216,12 @@ class FuelWebClient(object):
         Should be used before run any other check for services."""
         logger.info('Waiting {0} sec. for passed OSTF Sanity checks.'
                     .format(timeout))
-        with quiet_logger():
-            _wait(lambda: self.run_ostf(cluster_id,
-                                        test_sets=['sanity'],
-                                        should_fail=should_fail),
-                  interval=10, timeout=timeout)
+        with QuietLogger():
+            # TODO(astudenov): add timeout_msg
+            wait_pass(lambda: self.run_ostf(cluster_id,
+                                            test_sets=['sanity'],
+                                            should_fail=should_fail),
+                      interval=10, timeout=timeout)
         logger.info('OSTF Sanity checks passed successfully.')
 
     @logwrap
@@ -165,8 +230,9 @@ class FuelWebClient(object):
         """Wait for OSTF tests to finish, check that the tests specified
            in [tests_must_be_passed] are passed"""
 
-        logger.info('Assert OSTF tests are passed at cluster #%s: %s',
-                    cluster_id, tests_must_be_passed)
+        logger.info('Assert OSTF tests are passed at cluster #{0}: {1}'.format(
+                    cluster_id, pretty_log(tests_must_be_passed, indent=1)))
+
         set_result_list = self._ostf_test_wait(cluster_id, timeout)
         tests_pass_count = 0
         tests_count = len(tests_must_be_passed)
@@ -186,7 +252,8 @@ class FuelWebClient(object):
 
         assert_true(tests_pass_count == tests_count,
                     'The following tests have not succeeded, while they '
-                    'must have passed: %s' % fail_details)
+                    'must have passed: {}'.format(pretty_log(fail_details,
+                                                             indent=1)))
 
     @logwrap
     def assert_ostf_run(self, cluster_id, should_fail=0, failed_test_name=None,
@@ -195,9 +262,10 @@ class FuelWebClient(object):
            If [failed_test_name] tests are expected, ensure that these tests
            are not passed"""
 
-        logger.info('Assert OSTF run at cluster #%s. '
-                    'Should fail %s tests named %s',
-                    cluster_id, should_fail, failed_test_name)
+        logger.info('Assert OSTF run at cluster #{0}. '
+                    'Should fail {1} tests named {2}'.format(cluster_id,
+                                                             should_fail,
+                                                             failed_test_name))
         set_result_list = self._ostf_test_wait(cluster_id, timeout)
         failed_tests_res = []
         failed = 0
@@ -206,40 +274,36 @@ class FuelWebClient(object):
         for set_result in set_result_list:
             if set_result['testset'] not in test_sets:
                 continue
-            failed += len(
-                filter(
-                    lambda test: test['status'] == 'failure' or
-                    test['status'] == 'error',
-                    set_result['tests']
-                )
-            )
+            failed += len([test for test in set_result['tests']
+                           if test['status'] in {'failure', 'error'}])
 
-            [actual_failed_names.append(test['name'])
-             for test in set_result['tests']
-             if test['status'] not in ['success', 'disabled', 'skipped']]
+            for test in set_result['tests']:
+                test_result.update({test['name']: test['status']})
+                if test['status'] not in ['success', 'disabled', 'skipped']:
+                    actual_failed_names.append(test['name'])
+                    key = ('{name:s} ({status:s})'
+                           ''.format(name=test['name'], status=test['status']))
+                    failed_tests_res.append(
+                        {key: test['message']})
 
-            [test_result.update({test['name']:test['status']})
-             for test in set_result['tests']]
-
-            [failed_tests_res.append(
-                {'%s (%s)' % (test['name'], test['status']): test['message']})
-             for test in set_result['tests']
-             if test['status'] not in ['success', 'disabled', 'skipped']]
-
-        logger.info('OSTF test statuses are : {0}'.format(test_result))
+        logger.info('OSTF test statuses are :\n{}\n'.format(
+            pretty_log(test_result, indent=1)))
 
         if failed_test_name:
-            for test_name in failed_test_name:
-                assert_true(test_name in actual_failed_names,
+            for test_name in actual_failed_names:
+                assert_true(test_name in failed_test_name,
                             'WARNING! Unexpected fail: '
                             'expected {0}, actual {1}'.format(
-                                failed_test_name, actual_failed_names))
+                                failed_test_name, actual_failed_names)
+                            )
 
         assert_true(
             failed <= should_fail, 'Failed {0} OSTF tests; should fail'
                                    ' {1} tests. Names of failed tests: {2}'
-                                   .format(failed, should_fail,
-                                           failed_tests_res))
+                                   .format(failed,
+                                           should_fail,
+                                           pretty_log(failed_tests_res,
+                                                      indent=1)))
 
     def assert_release_state(self, release_name, state='available'):
         logger.info('Assert release %s has state %s', release_name, state)
@@ -252,8 +316,8 @@ class FuelWebClient(object):
     def assert_release_role_present(self, release_name, role_name):
         logger.info('Assert role %s is available in release %s',
                     role_name, release_name)
-        id = self.assert_release_state(release_name)
-        release_data = self.client.get_releases_details(release_id=id)
+        release_id = self.assert_release_state(release_name)
+        release_data = self.client.get_release(release_id=release_id)
         assert_equal(
             True, role_name in release_data['roles'],
             message='There is no {0} role in release id {1}'.format(
@@ -276,19 +340,29 @@ class FuelWebClient(object):
     @logwrap
     def assert_task_success(
             self, task, timeout=130 * 60, interval=5, progress=None):
+        def _message(_task):
+            if 'message' in _task:
+                return _task['message']
+            else:
+                return ''
+
         logger.info('Assert task %s is success', task)
         if not progress:
             task = self.task_wait(task, timeout, interval)
             assert_equal(
                 task['status'], 'ready',
-                "Task '{name}' has incorrect status. {} != {}".format(
-                    task['status'], 'ready', name=task["name"]
+                "Task '{0}' has incorrect status. {1} != {2}, '{3}'".format(
+                    task["name"], task['status'], 'ready', _message(task)
                 )
             )
         else:
             logger.info('Start to polling task progress')
             task = self.task_wait_progress(
                 task, timeout=timeout, interval=interval, progress=progress)
+            assert_not_equal(
+                task['status'], 'error',
+                "Task '{0}' has error status. '{1}'"
+                .format(task['status'], _message(task)))
             assert_true(
                 task['progress'] >= progress,
                 'Task has other progress{0}'.format(task['progress']))
@@ -299,10 +373,75 @@ class FuelWebClient(object):
         task = self.task_wait(task, timeout, interval)
         assert_equal(
             'error', task['status'],
-            "Task '{name}' has incorrect status. {} != {}".format(
-                task['status'], 'error', name=task["name"]
+            "Task '{name}' has incorrect status. {status} != {exp}".format(
+                status=task['status'], exp='error', name=task["name"]
             )
         )
+
+    @logwrap
+    def assert_all_tasks_completed(self, cluster_id=None):
+        cluster_info_template = "\n\tCluster ID: {cluster}{info}\n"
+        all_tasks = sorted(
+            self.client.get_all_tasks_list(),
+            key=lambda _tsk: _tsk['id'],
+            reverse=True
+        )
+
+        not_ready_tasks, deploy_tasks = checkers.incomplete_tasks(
+            all_tasks, cluster_id)
+
+        not_ready_transactions = checkers.incomplete_deploy(
+            {
+                cluster: self.client.get_deployment_task_hist(task_id)
+                for cluster, task_id in deploy_tasks.items()})
+
+        if len(not_ready_tasks) > 0:
+            task_details_template = (
+                "\n"
+                "\t\tTask name: {name}\n"
+                "\t\t\tStatus:    {status}\n"
+                "\t\t\tProgress:  {progress}\n"
+                "\t\t\tResult:    {result}\n"
+                "\t\t\tMessage:   {message}\n"
+                "\t\t\tTask ID:   {id}"
+            )
+
+            task_text = 'Not all tasks completed: {}'.format(
+                ''.join(
+                    cluster_info_template.format(
+                        cluster=cluster,
+                        info="".join(
+                            task_details_template.format(**task)
+                            for task in tasks))
+                    for cluster, tasks in sorted(not_ready_tasks.items())
+                ))
+            logger.error(task_text)
+            if len(not_ready_transactions) == 0:
+                # Else: we will raise assert with detailed info
+                # about deployment
+                assert_true(len(not_ready_tasks) == 0, task_text)
+
+        checkers.fail_deploy(not_ready_transactions)
+
+    def wait_node_is_online(self, node, timeout=60 * 5):
+        # transform devops node to nailgun node
+        if isinstance(node, Node):
+            node = self.get_nailgun_node_by_devops_node(node)
+        logger.info(
+            'Wait for node {!r} online status'.format(node['name']))
+        wait(lambda: self.get_nailgun_node_online_status(node),
+             timeout=timeout,
+             timeout_msg='Node {!r} failed to become online'
+                         ''.format(node['name']))
+
+    def wait_node_is_offline(self, devops_node, timeout=60 * 5):
+        logger.info(
+            'Wait for node {!r} offline status'.format(devops_node.name))
+        wait(lambda: not self.get_nailgun_node_by_devops_node(
+             devops_node)['online'],
+             timeout=timeout,
+             timeout_msg='Node {!r} failed to become offline'
+                         ''.format(devops_node.name))
 
     @logwrap
     def fqdn(self, devops_node):
@@ -315,9 +454,9 @@ class FuelWebClient(object):
     @logwrap
     def get_pcm_nodes(self, ctrl_node, pure=False):
         nodes = {}
-        remote = self.get_ssh_for_node(ctrl_node)
-        pcs_status = remote.execute('pcs status nodes')['stdout']
-        pcm_nodes = yaml.load(''.join(pcs_status).strip())
+        with self.get_ssh_for_node(ctrl_node) as remote:
+            pcm_nodes = remote.execute('pcs status nodes').stdout_yaml
+
         for status in ('Online', 'Offline', 'Standby'):
             list_nodes = (pcm_nodes['Pacemaker Nodes'][status] or '').split()
             if not pure:
@@ -329,23 +468,48 @@ class FuelWebClient(object):
 
     @logwrap
     def get_rabbit_running_nodes(self, ctrl_node):
-        remote = self.get_ssh_for_node(ctrl_node)
-        rabbit_status = ''.join(remote.execute(
-            'rabbitmqctl cluster_status')['stdout']).strip()
-        rabbit_nodes = re.search(
-            "\{running_nodes,\[(.*)\]\}",
-            rabbit_status).group(1).replace("'", "").split(',')
+        """
+
+        :param ctrl_node: str
+        :return: list
+        """
+        ip = self.get_node_ip_by_devops_name(ctrl_node)
+        cmd = 'rabbitmqctl cluster_status'
+        # If any rabbitmq nodes failed, we have return(70) from rabbitmqctl
+        # Acceptable list:
+        # 0  | EX_OK          | Self-explanatory
+        # 69 | EX_UNAVAILABLE | Failed to connect to node
+        # 70 | EX_SOFTWARE    | Any other error discovered when running command
+        #    |                | against live node
+        # 75 | EX_TEMPFAIL    | Temporary failure (e.g. something timed out)
+        rabbit_status = self.ssh_manager.execute_on_remote(
+            ip, cmd, raise_on_assert=False, assert_ec_equal=[0, 69, 70, 75]
+        )['stdout_str']
+        rabbit_status = re.sub(r',\n\s*', ',', rabbit_status)
+        found_nodes = re.search(
+            "\{running_nodes,\[([^\]]*)\]\}",
+            rabbit_status)
+        if not found_nodes:
+            logger.info(
+                'No running rabbitmq nodes found on {0}. Status:\n {1}'.format(
+                    ctrl_node, rabbit_status))
+            return []
+        rabbit_nodes = found_nodes.group(1).replace("'", "").split(',')
         logger.debug('rabbit nodes are {}'.format(rabbit_nodes))
         nodes = [node.replace('rabbit@', "") for node in rabbit_nodes]
+        hostname_prefix = self.ssh_manager.execute_on_remote(
+            ip, 'hiera node_name_prefix_for_messaging', raise_on_assert=False
+        )['stdout_str']
+        if hostname_prefix not in ('', 'nil'):
+            nodes = [n.replace(hostname_prefix, "") for n in nodes]
         return nodes
 
     @logwrap
     def assert_pacemaker(self, ctrl_node, online_nodes, offline_nodes):
         logger.info('Assert pacemaker status at devops node %s', ctrl_node)
-        fqdn_names = lambda nodes: sorted([self.fqdn(n) for n in nodes])
 
-        online = fqdn_names(online_nodes)
-        offline = fqdn_names(offline_nodes)
+        online = sorted([self.fqdn(n) for n in online_nodes])
+        offline = sorted([self.fqdn(n) for n in offline_nodes])
         try:
             wait(lambda: self.get_pcm_nodes(ctrl_node)['Online'] == online and
                  self.get_pcm_nodes(ctrl_node)['Offline'] == offline,
@@ -361,22 +525,23 @@ class FuelWebClient(object):
 
     @logwrap
     @upload_manifests
-    @update_ostf
     @update_fuel
     def create_cluster(self,
                        name,
                        settings=None,
-                       release_name=help_data.OPENSTACK_RELEASE,
-                       mode=DEPLOYMENT_MODE_SIMPLE,
+                       release_name=OPENSTACK_RELEASE,
+                       mode=DEPLOYMENT_MODE_HA,
                        port=514,
                        release_id=None,
-                       vcenter_value=None, ):
+                       configure_ssl=True):
         """Creates a cluster
         :param name:
         :param release_name:
         :param mode:
         :param settings:
         :param port:
+        :param configure_ssl:
+        :param release_id:
         :return: cluster_id
         """
         logger.info('Create cluster with name %s', name)
@@ -388,19 +553,34 @@ class FuelWebClient(object):
         if settings is None:
             settings = {}
 
+        if REPLACE_DEFAULT_REPOS and not REPLACE_DEFAULT_REPOS_ONLY_ONCE:
+            self.replace_default_repos(release_name=release_name)
+
         cluster_id = self.client.get_cluster_id(name)
         if not cluster_id:
             data = {
                 "name": name,
-                "release": str(release_id),
+                "release": release_id,
                 "mode": mode
             }
 
             if "net_provider" in settings:
+                data.update({'net_provider': settings["net_provider"]})
+
+            if "net_segment_type" in settings:
+                data.update({'net_segment_type': settings["net_segment_type"]})
+
+            # NEUTRON_SEGMENT_TYPE should not override any option
+            # configured from test, in case if test is going to set only
+            # 'net_provider' for a cluster.
+            if (NEUTRON_SEGMENT_TYPE and
+                    "net_provider" not in settings and
+                    "net_segment_type" not in settings):
                 data.update(
                     {
-                        'net_provider': settings["net_provider"],
-                        'net_segment_type': settings["net_segment_type"],
+                        'net_provider': NEUTRON,
+                        'net_segment_type': NEUTRON_SEGMENT[
+                            NEUTRON_SEGMENT_TYPE]
                     }
                 )
 
@@ -408,48 +588,87 @@ class FuelWebClient(object):
             cluster_id = self.client.get_cluster_id(name)
             logger.info('The cluster id is %s', cluster_id)
 
-            logger.info('Set cluster settings to %s', settings)
+            logger.info('Set cluster settings to {}'.format(
+                        pretty_log(settings, indent=1)))
             attributes = self.client.get_cluster_attributes(cluster_id)
 
             for option in settings:
-                section = False
-                if option in ('sahara', 'murano', 'ceilometer', 'mongo'):
+                section = ''
+                if option in ('sahara', 'murano', 'ceilometer', 'mongo',
+                              'ironic'):
                     section = 'additional_components'
-                if option in ('mongo_db_name', 'mongo_replset', 'mongo_user',
-                              'hosts_ip', 'mongo_password'):
+                elif option in {'mongo_db_name', 'mongo_replset', 'mongo_user',
+                                'hosts_ip', 'mongo_password'}:
                     section = 'external_mongo'
-                if option in ('volumes_ceph', 'images_ceph', 'ephemeral_ceph',
-                              'objects_ceph', 'osd_pool_size', 'volumes_lvm',
-                              'volumes_vmdk', 'images_vcenter'):
+                elif option in {'volumes_ceph', 'images_ceph',
+                                'ephemeral_ceph', 'objects_ceph',
+                                'osd_pool_size', 'volumes_lvm',
+                                'volumes_block_device', 'images_vcenter'}:
                     section = 'storage'
-                if option in ('tenant', 'password', 'user'):
+                elif option in {'tenant', 'password', 'user'}:
                     section = 'access'
-                if option == 'assign_to_all_nodes':
+                elif option == 'assign_to_all_nodes':
                     section = 'public_network_assignment'
-                if option in ('dns_list'):
+                elif option in {'neutron_l3_ha', 'neutron_dvr',
+                                'neutron_l2_pop', 'neutron_qos'}:
+                    section = 'neutron_advanced_configuration'
+                elif option in {'dns_list'}:
                     section = 'external_dns'
-                if option in ('ntp_list'):
+                elif option in {'ntp_list'}:
                     section = 'external_ntp'
+                elif option in {'propagate_task_deploy'}:
+                    section = 'common'
                 if section:
-                    attributes['editable'][section][option]['value'] =\
-                        settings[option]
-            if help_data.CLASSIC_PROVISIONING:
-                attributes['editable']['provision']['method']['value'] = \
-                    'cobbler'
+                    try:
+                        attributes['editable'][section][option]['value'] =\
+                            settings[option]
+                    except KeyError:
+                        if section not in attributes['editable']:
+                            raise KeyError(
+                                "Section '{0}' not in "
+                                "attributes['editable']: {1}".format(
+                                    section, attributes['editable'].keys()))
+                        raise KeyError(
+                            "Option {0} not in attributes['editable'][{1}]: "
+                            "{2}".format(
+                                option, section,
+                                attributes['editable'][section].keys()))
 
-            public_gw = self.environment.d_env.router(router_name="public")
+            # we should check DVR limitations
+            section = 'neutron_advanced_configuration'
+            if attributes['editable'][section]['neutron_dvr']['value']:
+                if attributes['editable'][section]['neutron_l3_ha']['value']:
+                    raise Exception("Neutron DVR and Neutron L3 HA can't be"
+                                    " used simultaneously.")
 
-            if help_data.FUEL_USE_LOCAL_NTPD and ('ntp_list' not in settings)\
+                if 'net_segment_type' in settings:
+                    net_segment_type = settings['net_segment_type']
+                elif NEUTRON_SEGMENT_TYPE:
+                    net_segment_type = NEUTRON_SEGMENT[NEUTRON_SEGMENT_TYPE]
+                else:
+                    net_segment_type = None
+
+                if not attributes['editable'][section]['neutron_l2_pop'][
+                        'value'] and net_segment_type == 'tun':
+                    raise Exception("neutron_l2_pop is not enabled but "
+                                    "it is required for VxLAN DVR "
+                                    "network configuration.")
+
+            public_gw = self.get_public_gw()
+
+            if help_data.FUEL_USE_LOCAL_NTPD\
+                    and ('ntp_list' not in settings)\
                     and checkers.is_ntpd_active(
-                        self.environment.d_env.get_admin_remote(), public_gw):
+                        self.ssh_manager.admin_ip, public_gw):
                 attributes['editable']['external_ntp']['ntp_list']['value'] =\
-                    public_gw
-                logger.info("Configuring cluster #{0} to use NTP server {1}"
+                    [public_gw]
+                logger.info("Configuring cluster #{0}"
+                            "to use NTP server {1}"
                             .format(cluster_id, public_gw))
 
             if help_data.FUEL_USE_LOCAL_DNS and ('dns_list' not in settings):
                 attributes['editable']['external_dns']['dns_list']['value'] =\
-                    public_gw
+                    [public_gw]
                 logger.info("Configuring cluster #{0} to use DNS server {1}"
                             .format(cluster_id, public_gw))
 
@@ -462,58 +681,146 @@ class FuelWebClient(object):
                 hpv_data = attributes['editable']['common']['libvirt_type']
                 hpv_data['value'] = "kvm"
 
-            if help_data.VCENTER_USE and vcenter_value:
+            if help_data.VCENTER_USE:
                 logger.info('Enable Dual Hypervisors Mode')
                 hpv_data = attributes['editable']['common']['use_vcenter']
                 hpv_data['value'] = True
 
-            if (help_data.OPENSTACK_RELEASE_UBUNTU in
-                    help_data.OPENSTACK_RELEASE and
-                    'repo_setup' in attributes['editable']):
+            if NOVA_QUOTAS_ENABLED:
+                logger.info('Enable Nova quotas')
+                nova_quotas = attributes['editable']['common']['nova_quota']
+                nova_quotas['value'] = True
 
-                repos_attr = attributes['editable']['repo_setup']['repos']
-                repos_attr['value'] = self.replace_ubuntu_repos(repos_attr)
+            if not help_data.TASK_BASED_ENGINE:
+                logger.info('Switch to Granular deploy')
+                attributes['editable']['common']['task_deploy']['value'] =\
+                    False
 
-            elif (help_data.OPENSTACK_RELEASE_CENTOS in
-                  help_data.OPENSTACK_RELEASE and
-                  'repo_setup' in attributes['editable']):
+            # Updating attributes is needed before updating
+            # networking configuration because additional networks
+            # may be created by new components like ironic
+            self.client.update_cluster_attributes(cluster_id, attributes)
 
-                repos_attr = attributes['editable']['repo_setup']['repos']
-                repos_attr['value'] = self.replace_centos_repos(repos_attr)
+            self.nodegroups_configure(cluster_id)
 
             logger.debug("Try to update cluster "
                          "with next attributes {0}".format(attributes))
             self.client.update_cluster_attributes(cluster_id, attributes)
 
-            if help_data.VCENTER_USE and vcenter_value:
-                logger.info('Configuring vCenter...')
-                vmware_attributes = \
-                    self.client.get_cluster_vmware_attributes(cluster_id)
-                vcenter_data = vmware_attributes['editable']
-                vcenter_data['value'] = vcenter_value
-                logger.debug("Try to update cluster with next "
-                             "vmware_attributes {0}".format(vmware_attributes))
-                self.client.update_cluster_vmware_attributes(cluster_id,
-                                                             vmware_attributes)
+            if configure_ssl:
+                self.ssl_configure(cluster_id)
 
-            logger.debug("Attributes of cluster were updated,"
-                         " going to update networks ...")
-            if MULTIPLE_NETWORKS:
-                node_groups = {n['name']: [] for n in NODEGROUPS}
-                self.update_nodegroups(cluster_id, node_groups)
-                for NODEGROUP in NODEGROUPS:
-                    self.update_network_configuration(cluster_id,
-                                                      nodegroup=NODEGROUP)
-            else:
-                self.update_network_configuration(cluster_id)
+            if UCA_ENABLED or settings.get('uca_enabled', False):
+                self.enable_uca(cluster_id)
 
         if not cluster_id:
-            raise Exception("Could not get cluster '%s'" % name)
+            raise Exception("Could not get cluster '{:s}'".format(name))
         # TODO: rw105719
         # self.client.add_syslog_server(
         #    cluster_id, self.environment.get_host_node_ip(), port)
 
         return cluster_id
+
+    @logwrap
+    def get_public_gw(self):
+        return self.environment.d_env.router(router_name="public")
+
+    @logwrap
+    def nodegroups_configure(self, cluster_id):
+        """Update nodegroups configuration
+        """
+        if not MULTIPLE_NETWORKS:
+            return
+
+        ng = {rack['name']: [] for rack in NODEGROUPS}
+        self.update_nodegroups(cluster_id=cluster_id, node_groups=ng)
+        self.update_nodegroups_network_configuration(cluster_id, NODEGROUPS)
+
+    @logwrap
+    def ssl_configure(self, cluster_id):
+        attributes = self.client.get_cluster_attributes(cluster_id)
+        change_cluster_ssl_config(attributes, SSL_CN)
+        logger.debug("Try to update cluster "
+                     "with next attributes {0}".format(attributes))
+        self.client.update_cluster_attributes(cluster_id, attributes)
+
+    @logwrap
+    def enable_uca(self, cluster_id):
+        attributes = self.client.get_cluster_attributes(cluster_id)
+        change_cluster_uca_config(attributes)
+        logger.debug("Try to update cluster "
+                     "with next attributes {0}".format(attributes))
+        self.client.update_cluster_attributes(cluster_id, attributes)
+
+    @logwrap
+    def vcenter_configure(self, cluster_id, vcenter_value=None,
+                          multiclusters=None, vc_glance=None,
+                          target_node_1='controllers',
+                          target_node_2='controllers'):
+
+        if not vcenter_value:
+            vcenter_value = {
+                "glance": {
+                    "vcenter_username": "",
+                    "datacenter": "",
+                    "vcenter_host": "",
+                    "vcenter_password": "",
+                    "datastore": "",
+                    "vcenter_insecure": True},
+                "availability_zones": [
+                    {"vcenter_username": VCENTER_USERNAME,
+                     "nova_computes": [
+                         {"datastore_regex": ".*",
+                          "vsphere_cluster": "Cluster1",
+                          "service_name": "vmcluster1",
+                          "target_node": {
+                              "current": {"id": target_node_1,
+                                          "label": target_node_1},
+                              "options": [{"id": "controllers",
+                                           "label": "controllers"}, ]},
+                          },
+
+                     ],
+                     "vcenter_host": VCENTER_IP,
+                     "az_name": "vcenter",
+                     "vcenter_password": VCENTER_PASSWORD,
+                     "vcenter_insecure": True
+
+                     }],
+                "network": {"esxi_vlan_interface": "vmnic0"}
+            }
+            if multiclusters:
+                multiclusters =\
+                    vcenter_value["availability_zones"][0]["nova_computes"]
+                multiclusters.append(
+                    {"datastore_regex": ".*",
+                     "vsphere_cluster": "Cluster2",
+                     "service_name": "vmcluster2",
+                     "target_node": {
+                         "current": {"id": target_node_2,
+                                     "label": target_node_2},
+                         "options": [{"id": "controllers",
+                                      "label": "controllers"}, ]},
+                     })
+            if vc_glance:
+                vcenter_value["glance"]["vcenter_username"] = VCENTER_USERNAME
+                vcenter_value["glance"]["datacenter"] = VCENTER_DATACENTER
+                vcenter_value["glance"]["vcenter_host"] = VCENTER_IP
+                vcenter_value["glance"]["vcenter_password"] = VCENTER_PASSWORD
+                vcenter_value["glance"]["datastore"] = VCENTER_DATASTORE
+
+        if help_data.VCENTER_USE:
+            logger.info('Configuring vCenter...')
+            vmware_attributes = \
+                self.client.get_cluster_vmware_attributes(cluster_id)
+            vcenter_data = vmware_attributes['editable']
+            vcenter_data['value'] = vcenter_value
+            logger.debug("Try to update cluster with next "
+                         "vmware_attributes {0}".format(vmware_attributes))
+            self.client.update_cluster_vmware_attributes(cluster_id,
+                                                         vmware_attributes)
+
+        logger.debug("Attributes of cluster were updated")
 
     def add_local_ubuntu_mirror(self, cluster_id, name='Auxiliary',
                                 path=help_data.LOCAL_MIRROR_UBUNTU,
@@ -525,20 +832,19 @@ class FuelWebClient(object):
         mirror = '{0},deb {1} {2} {3}'.format(name, mirror_url, suite, section)
 
         attributes = self.client.get_cluster_attributes(cluster_id)
-
         repos_attr = attributes['editable']['repo_setup']['repos']
-        repos_attr['value'] = self.add_ubuntu_extra_mirrors(
+
+        repos_attr['value'] = replace_repos.add_ubuntu_extra_mirrors(
             repos=repos_attr['value'],
             prefix=suite,
             mirrors=mirror,
             priority=priority)
 
-        self.report_ubuntu_repos(repos_attr['value'])
+        replace_repos.report_ubuntu_repos(repos_attr['value'])
         self.client.update_cluster_attributes(cluster_id, attributes)
 
-    def add_local_centos_mirror(self, cluster_id, name='Auxiliary',
+    def add_local_centos_mirror(self, cluster_id, repo_name='auxiliary',
                                 path=help_data.LOCAL_MIRROR_CENTOS,
-                                repo_name='auxiliary',
                                 priority=help_data.EXTRA_RPM_REPOS_PRIORITY):
         # Append new mirror to attributes of currently creating CentOS cluster
         mirror_url = path.replace('/var/www/nailgun',
@@ -546,244 +852,91 @@ class FuelWebClient(object):
         mirror = '{0},{1}'.format(repo_name, mirror_url)
 
         attributes = self.client.get_cluster_attributes(cluster_id)
-
         repos_attr = attributes['editable']['repo_setup']['repos']
-        repos_attr['value'] = self.add_centos_extra_mirrors(
+
+        repos_attr['value'] = replace_repos.add_centos_extra_mirrors(
             repos=repos_attr['value'],
             mirrors=mirror,
             priority=priority)
 
-        self.report_centos_repos(repos_attr['value'])
+        replace_repos.report_centos_repos(repos_attr['value'])
         self.client.update_cluster_attributes(cluster_id, attributes)
 
-    def replace_default_repos(self):
-        # Replace Ubuntu default repositories for the release
-        ubuntu_id = self.client.get_release_id(
-            release_name=help_data.OPENSTACK_RELEASE_UBUNTU)
-
-        ubuntu_release = self.client.get_release(ubuntu_id)
-        ubuntu_meta = ubuntu_release["attributes_metadata"]
-        repos_ubuntu = ubuntu_meta["editable"]["repo_setup"]["repos"]
-
-        repos_ubuntu["value"] = self.replace_ubuntu_repos(repos_ubuntu)
-        self.client.put_release(ubuntu_id, ubuntu_release)
-
-        # Replace CentOS default repositories for the release
-        centos_id = self.client.get_release_id(
-            release_name=help_data.OPENSTACK_RELEASE_CENTOS)
-
-        centos_release = self.client.get_release(centos_id)
-        centos_meta = centos_release["attributes_metadata"]
-        repos_centos = centos_meta["editable"]["repo_setup"]["repos"]
-
-        repos_centos["value"] = self.replace_centos_repos(repos_centos)
-        self.client.put_release(centos_id, centos_release)
-
-    def replace_ubuntu_repos(self, repos_attr):
-        # Walk thru repos_attr and replace/add extra Ubuntu mirrors
-        repos = []
-        if help_data.MIRROR_UBUNTU:
-            logger.info("Adding new mirrors: '{0}'"
-                        .format(help_data.MIRROR_UBUNTU))
-            repos = self.add_ubuntu_mirrors()
-            # Keep other (not upstream) repos, skip previously added ones
-            for repo_value in repos_attr['value']:
-                if 'archive.ubuntu.com' not in repo_value['uri']:
-                    if self.check_new_ubuntu_repo(repos, repo_value):
-                        repos.append(repo_value)
-                else:
-                    logger.warning("Removing mirror: '{0}'"
-                                   .format(repo_value['uri']))
+    def replace_default_repos(self, release_name=None):
+        if release_name is None:
+            for release_name in [help_data.OPENSTACK_RELEASE_UBUNTU,
+                                 help_data.OPENSTACK_RELEASE_UBUNTU_UCA]:
+                self.replace_release_repos(release_name=release_name)
         else:
-            # Use defaults from Nailgun if MIRROR_UBUNTU is not set
-            repos = repos_attr['value']
-        if help_data.EXTRA_DEB_REPOS:
-            repos = self.add_ubuntu_extra_mirrors(repos=repos)
-        if help_data.PATCHING_DISABLE_UPDATES:
-            for repo in repos:
-                if repo['name'] in ('mos-updates', 'mos-security'):
-                    repos.remove(repo)
+            self.replace_release_repos(release_name=release_name)
 
-        self.report_ubuntu_repos(repos)
-        return repos
-
-    def replace_centos_repos(self, repos_attr):
-        # Walk thru repos_attr and replace/add extra Centos mirrors
-        repos = []
-        if help_data.MIRROR_CENTOS:
-            logger.info("Adding new mirrors: '{0}'"
-                        .format(help_data.MIRROR_CENTOS))
-            repos = self.add_centos_mirrors()
-            # Keep other (not upstream) repos, skip previously added ones
-            for repo_value in repos_attr['value']:
-                # self.admin_node_ip while repo is located on master node
-                if self.admin_node_ip not in repo_value['uri']:
-                    if self.check_new_centos_repo(repos, repo_value):
-                        repos.append(repo_value)
-                else:
-                    logger.warning("Removing mirror: '{0}'"
-                                   .format(repo_value['uri']))
+    def replace_release_repos(self, release_name):
+        release_id = self.client.get_release_id(release_name=release_name)
+        release_data = self.client.get_release(release_id)
+        if release_data["state"] == "available":
+            logger.info("Replace default repository list for {0}: '{1}'"
+                        " release".format(release_id, release_name))
+            release_meta = release_data["attributes_metadata"]
+            release_repos = release_meta["editable"]["repo_setup"]["repos"]
+            if release_data["operating_system"] == "Ubuntu":
+                release_repos["value"] = replace_repos.replace_ubuntu_repos(
+                    release_repos, upstream_host='archive.ubuntu.com')
+                self.client.put_release(release_id, release_data)
+                replace_repos.report_ubuntu_repos(release_repos["value"])
+            elif release_data["operating_system"] == "CentOS":
+                release_repos["value"] = replace_repos.replace_centos_repos(
+                    release_repos, upstream_host=self.admin_node_ip)
+                self.client.put_release(release_id, release_data)
+                replace_repos.report_centos_repos(release_repos["value"])
+            else:
+                logger.info("Unknown Operating System for release {0}: '{1}'."
+                            " Repository list not updated".format(
+                                release_id, release_name))
         else:
-            # Use defaults from Nailgun if MIRROR_CENTOS is not set
-            repos = repos_attr['value']
-        if help_data.EXTRA_RPM_REPOS:
-            repos = self.add_centos_extra_mirrors(repos=repos)
-        if help_data.PATCHING_DISABLE_UPDATES:
-            for repo in repos:
-                if repo['name'] in ('mos-updates', 'mos-security'):
-                    repos.remove(repo)
+            logger.info("Release {0}: '{1}' is unavailable. Repository list"
+                        " not updated".format(release_id, release_name))
 
-        self.report_centos_repos(repos)
-        return repos
+    def get_cluster_repos(self, cluster_id):
+        attributes = self.client.get_cluster_attributes(cluster_id)
+        return attributes['editable']['repo_setup']['repos']
 
-    def report_ubuntu_repos(self, repos):
-        for x, rep in enumerate(repos):
-            logger.info(
-                "Ubuntu repo {0} '{1}': '{2} {3} {4} {5}', priority:{6}"
-                .format(x, rep['name'], rep['type'], rep['uri'],
-                        rep['suite'], rep['section'], rep['priority']))
+    def check_deploy_state(self, cluster_id, check_services=True,
+                           check_tasks=True):
+        if check_tasks:
+            self.assert_all_tasks_completed(cluster_id=cluster_id)
+        if check_services:
+            self.assert_ha_services_ready(cluster_id)
+            self.assert_os_services_ready(cluster_id)
+        if not DISABLE_SSL and not USER_OWNED_CERT:
+            with self.environment.d_env.get_admin_remote() as admin_remote:
+                copy_cert_from_master(admin_remote, cluster_id)
+        n_nodes = self.client.list_cluster_nodes(cluster_id)
+        for n in filter(lambda n: 'ready' in n['status'], n_nodes):
+            node = self.get_devops_node_by_nailgun_node(n)
+            if node:
+                node_name = node.name
+                with self.get_ssh_for_node(node_name) as remote:
+                    free = node_freemem(remote)
+                    hiera_roles = get_node_hiera_roles(remote, n['fqdn'])
+                node_status = {
+                    node_name:
+                    {
+                        'Host': n['hostname'],
+                        'Roles':
+                        {
+                            'Nailgun': n['roles'],
+                            'Hiera': hiera_roles,
+                        },
+                        'Memory':
+                        {
+                            'RAM': free['mem'],
+                            'SWAP': free['swap'],
+                        },
+                    },
+                }
 
-    def report_centos_repos(self, repos):
-        for x, rep in enumerate(repos):
-            logger.info(
-                "Centos repo {0} '{1}': '{2} {3}', priority:{4}"
-                .format(x, rep['name'], rep['type'], rep['uri'],
-                        rep['priority']))
-
-    def add_ubuntu_mirrors(self, repos=None, mirrors=help_data.MIRROR_UBUNTU,
-                           priority=help_data.MIRROR_UBUNTU_PRIORITY):
-        if not repos:
-            repos = []
-        # Add external Ubuntu repositories
-        for x, repo_str in enumerate(mirrors.split('|')):
-            repo_value = self.parse_ubuntu_repo(
-                repo_str, 'ubuntu-{0}'.format(x), priority)
-            if repo_value and self.check_new_ubuntu_repo(repos, repo_value):
-                repos.append(repo_value)
-        return repos
-
-    def add_centos_mirrors(self, repos=None, mirrors=help_data.MIRROR_CENTOS,
-                           priority=help_data.MIRROR_CENTOS_PRIORITY):
-        if not repos:
-            repos = []
-        # Add external Centos repositories
-        for x, repo_str in enumerate(mirrors.split('|')):
-            repo_value = self.parse_centos_repo(repo_str, priority)
-            if repo_value and self.check_new_centos_repo(repos, repo_value):
-                repos.append(repo_value)
-        return repos
-
-    def add_ubuntu_extra_mirrors(self, repos=None, prefix='extra',
-                                 mirrors=help_data.EXTRA_DEB_REPOS,
-                                 priority=help_data.EXTRA_DEB_REPOS_PRIORITY):
-        if not repos:
-            repos = []
-        # Add extra Ubuntu repositories with higher priority
-        for x, repo_str in enumerate(mirrors.split('|')):
-            repo_value = self.parse_ubuntu_repo(
-                repo_str, '{0}-{1}'.format(prefix, x), priority)
-
-            if repo_value and self.check_new_ubuntu_repo(repos, repo_value):
-                # Remove repos that use the same name
-                for repo in repos:
-                    if repo["name"] == repo_value["name"]:
-                        repos.remove(repo)
-                repos.append(repo_value)
-        return repos
-
-    def add_centos_extra_mirrors(self, repos=None,
-                                 mirrors=help_data.EXTRA_RPM_REPOS,
-                                 priority=help_data.EXTRA_RPM_REPOS_PRIORITY):
-        if not repos:
-            repos = []
-        # Add extra Centos repositories
-        for x, repo_str in enumerate(mirrors.split('|')):
-            repo_value = self.parse_centos_repo(repo_str, priority)
-            if repo_value and self.check_new_centos_repo(repos, repo_value):
-                # Remove repos that use the same name
-                for repo in repos:
-                    if repo["name"] == repo_value["name"]:
-                        repos.remove(repo)
-                repos.append(repo_value)
-        return repos
-
-    def check_new_ubuntu_repo(self, repos, repo_value):
-        # Checks that 'repo_value' is a new unique record for Ubuntu 'repos'
-        for repo in repos:
-            if (repo["type"] == repo_value["type"] and
-                    repo["uri"] == repo_value["uri"] and
-                    repo["suite"] == repo_value["suite"] and
-                    repo["section"] == repo_value["section"]):
-                return False
-        return True
-
-    def check_new_centos_repo(self, repos, repo_value):
-        # Checks that 'repo_value' is a new unique record for Centos 'repos'
-        for repo in repos:
-            if repo["uri"] == repo_value["uri"]:
-                return False
-        return True
-
-    def parse_ubuntu_repo(self, repo_string, name, priority):
-        # Validate DEB repository string format
-        results = re.search("""
-            ^                 # [beginning of the string]
-            ([\w\-\.\/]+)?    # group 1: optional repository name (for Nailgun)
-            ,?                # [optional comma separator]
-            (deb|deb-src)     # group 2: type; search for 'deb' or 'deb-src'
-            \s+               # [space separator]
-            (                 # group 3: uri;
-            \w+:\/\/          #   - protocol, i.e. 'http://'
-            [\w\-\.\/]+       #   - hostname
-            (?::\d+)          #   - port, i.e. ':8080', if exists
-            ?[\w\-\.\/]+      #   - rest of the path, if exists
-            )                 #   - end of group 2
-            \s+               # [space separator]
-            ([\w\-\.\/]+)     # group 4: suite;
-            \s*               # [space separator], if exists
-            (                 # group 5: section;
-            [\w\-\.\/\s]*     #   - several space-separated names, or None
-            )                 #   - end of group 4
-            ,?                # [optional comma separator]
-            (\d+)?            # group 6: optional priority of the repository
-            $                 # [ending of the string]""",
-                            repo_string.strip(), re.VERBOSE)
-        if results:
-            return {"name": results.group(1) or name,
-                    "priority": int(results.group(6) or priority),
-                    "type": results.group(2),
-                    "uri": results.group(3),
-                    "suite": results.group(4),
-                    "section": results.group(5) or ''}
-        else:
-            logger.error("Provided DEB repository has incorrect format: {}"
-                         .format(repo_string))
-
-    def parse_centos_repo(self, repo_string, priority):
-        # Validate RPM repository string format
-        results = re.search("""
-            ^                 # [beginning of the string]
-            ([\w\-\.\/]+)     # group 1: repo name
-            ,                 # [comma separator]
-            (                 # group 2: uri;
-            \w+:\/\/          #   - protocol, i.e. 'http://'
-            [\w\-\.\/]+       #   - hostname
-            (?::\d+)          #   - port, i.e. ':8080', if exists
-            ?[\w\-\.\/]+      #   - rest of the path, if exists
-            )                 #   - end of group 2
-            \s*               # [space separator]
-            ,?                # [optional comma separator]
-            (\d+)?            # group 3: optional priority of the repository
-            $                 # [ending of the string]""",
-                            repo_string.strip(), re.VERBOSE)
-        if results:
-            return {"name": results.group(1),
-                    "priority": int(results.group(3) or priority),
-                    "type": 'rpm',
-                    "uri": results.group(2)}
-        else:
-            logger.error("Provided RPM repository has incorrect format: {}"
-                         .format(repo_string))
+                logger.info('Node status: {}'.format(pretty_log(node_status,
+                                                                indent=1)))
 
     @download_packages_json
     @download_astute_yaml
@@ -791,26 +944,127 @@ class FuelWebClient(object):
     @check_repos_management
     @custom_repo
     def deploy_cluster_wait(self, cluster_id, is_feature=False,
-                            timeout=130 * 60, interval=30,
-                            check_services=True):
-        if not is_feature:
+                            timeout=help_data.DEPLOYMENT_TIMEOUT, interval=30,
+                            check_services=True, check_tasks=True,
+                            allow_partially_deploy=False):
+        cluster_attributes = self.client.get_cluster_attributes(cluster_id)
+        self.client.assign_ip_address_before_deploy_start(cluster_id)
+        network_settings = self.client.get_networks(cluster_id)
+        if not is_feature and help_data.DEPLOYMENT_RETRIES == 1:
             logger.info('Deploy cluster %s', cluster_id)
             task = self.deploy_cluster(cluster_id)
             self.assert_task_success(task, interval=interval, timeout=timeout)
-        else:
-            logger.info('Provision nodes of a cluster %s', cluster_id)
-            task = self.client.provision_nodes(cluster_id)
-            self.assert_task_success(task, timeout=timeout, interval=interval)
-            logger.info('Deploy nodes of a cluster %s', cluster_id)
+            self.check_cluster_status(cluster_id, allow_partially_deploy)
+            self.check_deploy_state(cluster_id, check_services, check_tasks)
+            return
+
+        logger.info('Provision nodes of a cluster %s', cluster_id)
+        task = self.client.provision_nodes(cluster_id)
+        self.assert_task_success(task, timeout=timeout, interval=interval)
+
+        for retry_number in range(help_data.DEPLOYMENT_RETRIES):
+            logger.info('Deploy nodes of a cluster %s, run: %s',
+                        cluster_id, str(retry_number + 1))
             task = self.client.deploy_nodes(cluster_id)
             self.assert_task_success(task, timeout=timeout, interval=interval)
-        if check_services:
-            self.assert_ha_services_ready(cluster_id)
-            self.assert_os_services_ready(cluster_id)
+            self.check_cluster_status(cluster_id, allow_partially_deploy)
+            self.check_deploy_state(cluster_id, check_services, check_tasks)
+        self.check_cluster_settings(cluster_id, cluster_attributes)
+        self.check_network_settings(cluster_id, network_settings)
+        self.check_deployment_info_save_for_task(cluster_id)
 
-    def deploy_cluster_wait_progress(self, cluster_id, progress):
+    def check_cluster_status(self, cluster_id, allow_partially_deploy):
+        cluster_info = self.client.get_cluster(cluster_id)
+        cluster_status = cluster_info['status']
+        error_msg = \
+            "Cluster is not deployed: some nodes are in the Error state"
+        check = 'operational' in cluster_status
+        if not check and allow_partially_deploy:
+            logger.warning(error_msg)
+        elif not check:
+            assert_true(check, error_msg)
+        else:
+            logger.info("Cluster with id {} is in Operational state".format(
+                cluster_id))
+
+    @logwrap
+    def check_cluster_settings(self, cluster_id, cluster_attributes):
+        task_id = self.get_last_task_id(cluster_id, 'deployment')
+        cluster_settings = \
+            self.client.get_cluster_settings_for_deployment_task(task_id)
+        logger.debug('Cluster settings before deploy {}'.format(
+            cluster_attributes))
+        logger.debug('Cluster settings after deploy {}'.format(
+            cluster_settings))
+        assert_equal(cluster_attributes, cluster_settings,
+                     message='Cluster attributes before deploy are not equal'
+                             ' with cluster settings after deploy')
+
+    @logwrap
+    def check_network_settings(self, cluster_id, network_settings):
+        task_id = self.get_last_task_id(cluster_id, 'deployment')
+        network_configuration = \
+            self.client.get_network_configuration_for_deployment_task(task_id)
+        logger.debug('Network settings before deploy {}'.format(
+            network_settings))
+        logger.debug('Network settings after deploy {}'.format(
+            network_configuration))
+        assert_equal(network_settings, network_configuration,
+                     message='Network settings from cluster configuration '
+                             'and deployment task are not equal')
+
+    @logwrap
+    def check_deployment_info_save_for_task(self, cluster_id):
+        try:
+            task_id = self.get_last_task_id(cluster_id, 'deployment')
+            self.client.get_deployment_info_for_task(task_id)
+        except Exception:
+            logger.error(
+                "Cannot get information about deployment for task {}".format(
+                    task_id))
+
+    @logwrap
+    def get_last_task_id(self, cluster_id, task_name):
+        filtered_tasks = self.filter_tasks(self.client.get_tasks(),
+                                           cluster=cluster_id,
+                                           name=task_name)
+        return max([task['id'] for task in filtered_tasks])
+
+    @staticmethod
+    @logwrap
+    def filter_tasks(tasks, **filters):
+        res = []
+        for task in tasks:
+            for f_key, f_value in six.iteritems(filters):
+                if task.get(f_key) != f_value:
+                    break
+            else:
+                res.append(task)
+        return res
+
+    @logwrap
+    def wait_for_tasks_presence(self, get_tasks, **filters):
+        wait(lambda: self.filter_tasks(get_tasks(), **filters),
+             timeout=300,
+             timeout_msg="Timeout exceeded while waiting for tasks.")
+
+    def deploy_cluster_wait_progress(self, cluster_id, progress,
+                                     return_task=None):
         task = self.deploy_cluster(cluster_id)
         self.assert_task_success(task, interval=30, progress=progress)
+        if return_task:
+            return task
+
+    def redeploy_cluster_changes_wait_progress(self, cluster_id, progress,
+                                               data=None, return_task=None):
+        logger.info('Re-deploy cluster {}'
+                    ' to apply the changed settings'.format(cluster_id))
+        if data is None:
+            data = {}
+        task = self.client.redeploy_cluster_changes(cluster_id, data)
+        self.assert_task_success(task, interval=30, progress=progress)
+        if return_task:
+            return task
 
     @logwrap
     def deploy_cluster(self, cluster_id):
@@ -819,31 +1073,42 @@ class FuelWebClient(object):
         return self.client.deploy_cluster_changes(cluster_id)
 
     @logwrap
-    def get_cluster_floating_list(self, node_name):
-        logger.info('Get floating IPs list at %s devops node', node_name)
-        remote = self.get_ssh_for_node(node_name)
-        ret = remote.check_call('/usr/bin/nova-manage floating list')
-        ret_str = ''.join(ret['stdout'])
-        return re.findall('(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', ret_str)
+    def get_cluster_predefined_networks_name(self, cluster_id):
+        net_params = self.client.get_networks(
+            cluster_id)['networking_parameters']
+        return {'private_net': net_params.get('internal_name', 'net04'),
+                'external_net': net_params.get('floating_name', 'net04_ext')}
+
+    @logwrap
+    def get_cluster_floating_list(self, os_conn, cluster_id):
+        logger.info('Get floating IPs list at cluster #{0}'.format(cluster_id))
+
+        subnet = os_conn.get_subnet('{0}__subnet'.format(
+            self.get_cluster_predefined_networks_name(
+                cluster_id)['external_net']))
+        ret = []
+        for pool in subnet['allocation_pools']:
+            ret.extend([str(ip) for ip in
+                        netaddr.iter_iprange(pool['start'], pool['end'])])
+        return ret
 
     @logwrap
     def get_cluster_block_devices(self, node_name):
         logger.info('Get %s node block devices (lsblk)', node_name)
-        remote = self.get_ssh_for_node(node_name)
-        ret = remote.check_call('/bin/lsblk')
-        return ''.join(ret['stdout'])
+        with self.get_ssh_for_node(node_name) as remote:
+            return remote.check_call('/bin/lsblk').stdout_str
 
     @logwrap
     def get_pacemaker_status(self, controller_node_name):
         logger.info('Get pacemaker status at %s node', controller_node_name)
-        remote = self.get_ssh_for_node(controller_node_name)
-        return ''.join(remote.check_call('crm_mon -1')['stdout'])
+        with self.get_ssh_for_node(controller_node_name) as remote:
+            return ''.join(remote.check_call('crm_mon -1')['stdout'])
 
     @logwrap
     def get_pacemaker_config(self, controller_node_name):
         logger.info('Get pacemaker config at %s node', controller_node_name)
-        remote = self.get_ssh_for_node(controller_node_name)
-        return ''.join(remote.check_call('crm_resource --list')['stdout'])
+        with self.get_ssh_for_node(controller_node_name) as remote:
+            return ''.join(remote.check_call('crm_resource --list')['stdout'])
 
     @logwrap
     def get_pacemaker_resource_location(self, controller_node_name,
@@ -851,14 +1116,14 @@ class FuelWebClient(object):
         """Get devops nodes where the resource is running."""
         logger.info('Get pacemaker resource %s life status at %s node',
                     resource_name, controller_node_name)
-        remote = self.get_ssh_for_node(controller_node_name)
         hosts = []
-        for line in remote.check_call(
-                'crm_resource --resource {0} '
-                '--locate --quiet'.format(resource_name))['stdout']:
-            hosts.append(
-                self.get_devops_node_by_nailgun_fqdn(line.strip()))
-        remote.clear()
+        with self.get_ssh_for_node(controller_node_name) as remote:
+            for line in remote.check_call(
+                    'crm_resource --resource {0} '
+                    '--locate --quiet'.format(resource_name))['stdout']:
+                hosts.append(
+                    self.get_devops_node_by_nailgun_fqdn(line.strip()))
+
         return hosts
 
     @logwrap
@@ -867,7 +1132,9 @@ class FuelWebClient(object):
         logger.info('Get ID of a last created cluster')
         clusters = self.client.list_clusters()
         if len(clusters) > 0:
-            return clusters.pop()['id']
+            return sorted(
+                clusters, key=lambda cluster: cluster['id']
+            ).pop()['id']
         return None
 
     @logwrap
@@ -886,12 +1153,21 @@ class FuelWebClient(object):
             self.environment.d_env.get_node(name=node_name))
 
     @logwrap
+    def get_nailgun_node_by_base_name(self, base_node_name):
+        logger.debug('Get nailgun node by "{0}" base '
+                     'node name.'.format(base_node_name))
+        nodes = self.client.list_nodes()
+        for node in nodes:
+            if base_node_name in node['name']:
+                return node
+
+    @logwrap
     def get_nailgun_node_by_devops_node(self, devops_node):
         """Return slave node description.
         Returns dict with nailgun slave node description if node is
         registered. Otherwise return None.
         """
-        d_macs = {i.mac_address.upper() for i in devops_node.interfaces}
+        d_macs = {netaddr.EUI(i.mac_address) for i in devops_node.interfaces}
         logger.debug('Verify that nailgun api is running')
         attempts = ATTEMPTS
         nodes = []
@@ -909,13 +1185,18 @@ class FuelWebClient(object):
                 time.sleep(TIMEOUT)
         logger.debug('Look for nailgun node by macs %s', d_macs)
         for nailgun_node in nodes:
-            macs = {i['mac'] for i in nailgun_node['meta']['interfaces']}
+            node_nics = self.client.get_node_interfaces(nailgun_node['id'])
+            macs = {netaddr.EUI(nic['mac'])
+                    for nic in node_nics if nic['type'] == 'ether'}
             logger.debug('Look for macs returned by nailgun {0}'.format(macs))
             # Because our HAproxy may create some interfaces
             if d_macs.issubset(macs):
                 nailgun_node['devops_name'] = devops_node.name
                 return nailgun_node
-        return None
+        # On deployed environment MAC addresses of bonded network interfaces
+        # are changes and don't match addresses associated with devops node
+        if BONDING:
+            return self.get_nailgun_node_by_base_name(devops_node.name)
 
     @logwrap
     def get_nailgun_node_by_fqdn(self, fqdn):
@@ -929,6 +1210,19 @@ class FuelWebClient(object):
                 return nailgun_node
 
     @logwrap
+    def get_nailgun_node_by_status(self, status):
+        """Return nailgun nodes with status
+
+        :type status: String
+            :rtype: List
+        """
+        returned_nodes = []
+        for nailgun_node in self.client.list_nodes():
+            if nailgun_node['status'] == status:
+                returned_nodes.append(nailgun_node)
+        return returned_nodes
+
+    @logwrap
     def find_devops_node_by_nailgun_fqdn(self, fqdn, devops_nodes):
         """Return devops node by nailgun fqdn
 
@@ -937,10 +1231,11 @@ class FuelWebClient(object):
             :rtype: Devops Node or None
         """
         nailgun_node = self.get_nailgun_node_by_fqdn(fqdn)
-        macs = {i['mac'] for i in nailgun_node['meta']['interfaces']}
+        macs = {netaddr.EUI(i['mac']) for i in
+                nailgun_node['meta']['interfaces']}
         for devops_node in devops_nodes:
-            devops_macs = {i.mac_address.upper()
-                           for i in devops_node.interfaces}
+            devops_macs = {netaddr.EUI(i.mac_address) for i in
+                           devops_node.interfaces}
             if devops_macs == macs:
                 return devops_node
 
@@ -953,14 +1248,14 @@ class FuelWebClient(object):
         """
         for node in self.environment.d_env.nodes():
             for iface in node.interfaces:
-                if iface.mac_address.lower() == mac_address.lower():
+                if netaddr.EUI(iface.mac_address) == netaddr.EUI(mac_address):
                     return node
 
     @logwrap
     def get_devops_nodes_by_nailgun_nodes(self, nailgun_nodes):
         """Return devops node by nailgun node
 
-        :type nailgun_node: List
+        :type nailgun_nodes: List
             :rtype: list of Nodes or None
         """
         d_nodes = [self.get_devops_node_by_nailgun_node(n) for n
@@ -989,7 +1284,8 @@ class FuelWebClient(object):
             self.get_nailgun_node_by_fqdn(fqdn))
 
     @logwrap
-    def get_nailgun_cluster_nodes_by_roles(self, cluster_id, roles):
+    def get_nailgun_cluster_nodes_by_roles(self, cluster_id, roles,
+                                           role_status='roles'):
         """Return list of nailgun nodes from cluster with cluster_id which have
         a roles
 
@@ -998,13 +1294,29 @@ class FuelWebClient(object):
             :rtype: list
         """
         nodes = self.client.list_cluster_nodes(cluster_id=cluster_id)
-        return [n for n in nodes if set(roles) <= set(n['roles'])]
+        return [n for n in nodes if set(roles) <= set(n[role_status])]
+
+    @logwrap
+    def get_node_ip_by_devops_name(self, node_name):
+        """Get node ip by it's devops name (like "slave-01" and etc)
+
+        :param node_name: str
+        :return: str
+        """
+        # TODO: This method should be part of fuel-devops
+        try:
+            node = self.get_nailgun_node_by_devops_node(
+                self.environment.d_env.get_node(name=node_name))
+        except DevopsObjNotFound:
+            node = self.get_nailgun_node_by_fqdn(node_name)
+        assert_true(node is not None,
+                    'Node with name "{0}" not found!'.format(node_name))
+        return node['ip']
 
     @logwrap
     def get_ssh_for_node(self, node_name):
-        ip = self.get_nailgun_node_by_devops_node(
-            self.environment.d_env.get_node(name=node_name))['ip']
-        return self.environment.d_env.get_ssh_to_remote(ip)
+        return self.environment.d_env.get_ssh_to_remote(
+            self.get_node_ip_by_devops_name(node_name))
 
     @logwrap
     def get_ssh_for_role(self, nodes_dict, role):
@@ -1013,10 +1325,23 @@ class FuelWebClient(object):
         return self.get_ssh_for_node(node_name)
 
     @logwrap
+    def get_ssh_for_nailgun_node(self, nailgun_node):
+        return self.environment.d_env.get_ssh_to_remote(nailgun_node['ip'])
+
+    @logwrap
     def is_node_discovered(self, nailgun_node):
         return any(
-            map(lambda node: node['mac'] == nailgun_node['mac']
-                and node['status'] == 'discover', self.client.list_nodes()))
+            map(lambda node:
+                node['mac'] == nailgun_node['mac'] and
+                node['status'] == 'discover', self.client.list_nodes()))
+
+    def wait_node_is_discovered(self, nailgun_node, timeout=6 * 60):
+        logger.info('Wait for node {!r} to become discovered'
+                    ''.format(nailgun_node['name']))
+        wait(lambda: self.is_node_discovered(nailgun_node),
+             timeout=timeout,
+             timeout_msg='Node {!r} failed to become discovered'
+                         ''.format(nailgun_node['name']))
 
     @logwrap
     def run_network_verify(self, cluster_id):
@@ -1032,7 +1357,7 @@ class FuelWebClient(object):
 
         test_sets = test_sets or ['smoke', 'sanity']
         timeout = timeout or 30 * 60
-        self.client.ostf_run_tests(cluster_id, test_sets)
+        self.fuel_client.ostf.run_tests(cluster_id, test_sets)
         if tests_must_be_passed:
             self.assert_ostf_run_certain(
                 cluster_id,
@@ -1058,7 +1383,8 @@ class FuelWebClient(object):
                         test['status'] != 'disabled'):
                     tests_res.append({test['name']: test['status']})
 
-        logger.info('OSTF test statuses are : {0}'.format(tests_res))
+        logger.info('OSTF test statuses are : {0}'
+                    .format(pretty_log(tests_res, indent=1)))
         return tests_res
 
     @logwrap
@@ -1067,7 +1393,7 @@ class FuelWebClient(object):
                              retries=None, timeout=15 * 60):
         """Run a single OSTF test"""
 
-        self.client.ostf_run_singe_test(cluster_id, test_sets, test_name)
+        self.fuel_client.ostf.run_tests(cluster_id, test_sets, test_name)
         if retries:
             return self.return_ostf_results(cluster_id, timeout=timeout,
                                             test_sets=test_sets)
@@ -1077,75 +1403,93 @@ class FuelWebClient(object):
                                          timeout=timeout)
 
     @logwrap
-    def task_wait(self, task, timeout, interval=5):
-        logger.info('Wait for task %s %s seconds', task, timeout)
+    def task_wait(self, task, timeout, interval=5, states=None):
+        # check task is finished by default
+        states = states or ('ready', 'error')
+        logger.info('Wait for task {0} seconds: {1}'.format(
+                    timeout, pretty_log(task, indent=1)))
         start = time.time()
-        try:
-            wait(
-                lambda: self.client.get_task(
-                    task['id'])['status'] != 'running',
-                interval=interval,
-                timeout=timeout
-            )
-        except TimeoutError:
-            raise TimeoutError(
-                "Waiting task \"{task}\" timeout {timeout} sec "
-                "was exceeded: ".format(task=task["name"], timeout=timeout))
+
+        wait(
+            lambda: (self.client.get_task(task['id'])['status'] in states),
+            interval=interval,
+            timeout=timeout,
+            timeout_msg='Waiting task {0!r} timeout {1} sec '
+                        'was exceeded'.format(task['name'], timeout))
+
         took = time.time() - start
         task = self.client.get_task(task['id'])
-        logger.info('Task %s finished. Took %d seconds', task, took)
+        logger.info('Task changed its state to one of {}. Took {} seconds.'
+                    ' {}'.format(states, took, pretty_log(task, indent=1)))
         return task
 
     @logwrap
     def task_wait_progress(self, task, timeout, interval=5, progress=None):
-        try:
-            logger.info(
-                'start to wait with timeout {0} '
-                'interval {1}'.format(timeout, interval))
-            wait(
-                lambda: self.client.get_task(
-                    task['id'])['progress'] >= progress,
-                interval=interval,
-                timeout=timeout
-            )
-        except TimeoutError:
-            raise TimeoutError(
-                "Waiting task \"{task}\" timeout {timeout} sec "
-                "was exceeded: ".format(task=task["name"], timeout=timeout))
-
+        logger.info('start to wait with timeout {0} '
+                    'interval {1}'.format(timeout, interval))
+        wait(
+            lambda: self.client.get_task(
+                task['id'])['progress'] >= progress,
+            interval=interval,
+            timeout=timeout,
+            timeout_msg='Waiting task {0!r} timeout {1} sec '
+                        'was exceeded'.format(task["name"], timeout))
         return self.client.get_task(task['id'])
+
+    # TODO(ddmitriev): this method will be replaced
+    # after switching to fuel-devops3.0
+    # pylint: disable=no-self-use
+    def get_node_group_and_role(self, node_name, nodes_dict):
+        if MULTIPLE_NETWORKS:
+            node_roles = nodes_dict[node_name][0]
+            node_group = nodes_dict[node_name][1]
+        else:
+            node_roles = nodes_dict[node_name]
+            node_group = 'default'
+        return node_group, node_roles
+    # pylint: enable=no-self-use
 
     @logwrap
     def update_nodes(self, cluster_id, nodes_dict,
                      pending_addition=True, pending_deletion=False,
-                     update_nodegroups=False, contrail=False):
+                     update_nodegroups=False, custom_names=None,
+                     update_interfaces=True):
+
+        failed_nodes = {}
+        for node_name, node_roles in nodes_dict.items():
+            try:
+                self.environment.d_env.get_node(name=node_name)
+            except DevopsObjNotFound:
+                failed_nodes[node_name] = node_roles
+        if failed_nodes:
+            text = 'Some nodes is inaccessible:\n'
+            for node_name, node_roles in sorted(failed_nodes.items()):
+                text += '\t{name} for roles: {roles!s}\n'.format(
+                    name=node_name,
+                    roles=['{}'.format(node) for node in sorted(node_roles)])
+            text += 'Impossible to continue!'
+            logger.error(text)
+            raise KeyError(sorted(list(failed_nodes.keys())))
 
         # update nodes in cluster
         nodes_data = []
         nodes_groups = {}
         updated_nodes = []
         for node_name in nodes_dict:
-            if MULTIPLE_NETWORKS:
-                node_roles = nodes_dict[node_name][0]
-                node_group = nodes_dict[node_name][1]
-            else:
-                node_roles = nodes_dict[node_name]
-                node_group = 'default'
-
             devops_node = self.environment.d_env.get_node(name=node_name)
 
-            wait(lambda:
-                 self.get_nailgun_node_by_devops_node(devops_node)['online'],
-                 timeout=60 * 2)
+            node_group, node_roles = self.get_node_group_and_role(node_name,
+                                                                  nodes_dict)
+            self.wait_node_is_online(devops_node, timeout=60 * 2)
             node = self.get_nailgun_node_by_devops_node(devops_node)
-            assert_true(node['online'],
-                        'Node {} is online'.format(node['mac']))
 
-            if contrail and nodes_dict[node_name][0] == 'base-os':
-                name = 'contrail-' + node_name.split('-')[1].strip('0')
-
+            if custom_names:
+                name = custom_names.get(node_name,
+                                        '{}_{}'.format(
+                                            node_name,
+                                            "_".join(node_roles)))
             else:
-                name = '{}_{}'.format(node_name, "_".join(node_roles))
+                name = '{0}_{1}'.format(node_name, "_".join(node_roles))
 
             node_data = {
                 'cluster_id': cluster_id,
@@ -1167,33 +1511,50 @@ class FuelWebClient(object):
         self.client.update_nodes(nodes_data)
 
         nailgun_nodes = self.client.list_cluster_nodes(cluster_id)
-        cluster_node_ids = map(lambda _node: str(_node['id']), nailgun_nodes)
+        cluster_node_ids = [str(_node['id']) for _node in nailgun_nodes]
         assert_true(
             all([node_id in cluster_node_ids for node_id in node_ids]))
 
-        if not pending_deletion:
+        if update_interfaces and not pending_deletion:
             self.update_nodes_interfaces(cluster_id, updated_nodes)
         if update_nodegroups:
-            self.update_nodegroups(nodes_groups)
+            self.update_nodegroups(cluster_id=cluster_id,
+                                   node_groups=nodes_groups)
 
         return nailgun_nodes
+
+    @logwrap
+    def delete_node(self, node_id, interval=30, timeout=600):
+        task = self.client.delete_node(node_id)
+        logger.debug("task info is {}".format(task))
+        self.assert_task_success(task, interval=interval, timeout=timeout)
 
     @logwrap
     def update_node_networks(self, node_id, interfaces_dict,
                              raw_data=None,
                              override_ifaces_params=None):
-        # fuelweb_admin is always on eth0
-        interfaces_dict['eth0'] = interfaces_dict.get('eth0', [])
-        if 'fuelweb_admin' not in interfaces_dict['eth0']:
-            interfaces_dict['eth0'].append('fuelweb_admin')
-
         interfaces = self.client.get_node_interfaces(node_id)
 
         if raw_data is not None:
             interfaces.extend(raw_data)
 
+        def get_bond_ifaces():
+            # Filter out all interfaces to be bonded
+            ifaces = []
+            for bond in [i for i in interfaces if i['type'] == 'bond']:
+                ifaces.extend(s['name'] for s in bond['slaves'])
+            return ifaces
+
+        # fuelweb_admin is always on 1st iface unless the iface is not bonded
+        iface = iface_alias('eth0')
+        if iface not in get_bond_ifaces():
+            interfaces_dict[iface] = interfaces_dict.get(iface,
+                                                         [])
+            if 'fuelweb_admin' not in interfaces_dict[iface]:
+                interfaces_dict[iface].append('fuelweb_admin')
+
         def get_iface_by_name(ifaces, name):
-            iface = filter(lambda iface: iface['name'] == name, ifaces)
+            iface = [_iface for _iface in ifaces if _iface['name'] == name]
             assert_true(len(iface) > 0,
                         "Interface with name {} is not present on "
                         "node. Please check override params.".format(name))
@@ -1242,6 +1603,29 @@ class FuelWebClient(object):
                     size += volume['size']
         return size
 
+    def get_node_partition_size(self, node_id, partition_name):
+        disks = self.client.get_node_disks(node_id)
+        size = 0
+        logger.debug('Disks of node-{}: \n{}'.format(node_id,
+                                                     pretty_log(disks)))
+        for disk in disks:
+            for volume in disk['volumes']:
+                if volume['name'] == partition_name:
+                    size += volume['size']
+        return size
+
+    @logwrap
+    def update_node_partitioning(self, node, disk='vdc',
+                                 node_role='cinder', unallocated_size=11116):
+        node_size = self.get_node_disk_size(node['id'], disk)
+        disk_part = {
+            disk: {
+                node_role: node_size - unallocated_size
+            }
+        }
+        self.update_node_disk(node['id'], disk_part)
+        return node_size - unallocated_size
+
     @logwrap
     def update_vlan_network_fixed(
             self, cluster_id, amount=1, network_size=256):
@@ -1267,20 +1651,32 @@ class FuelWebClient(object):
                                     "Node Interface",
                                     "Expected VLAN (not received)"))
                     for res in task['result']:
+                        name = None
+                        mac = None
+                        interface = None
+                        absent_vlans = []
+                        if 'name' in res:
+                            name = res['name']
+                        if 'mac' in res:
+                            mac = res['mac']
+                        if 'interface' in res:
+                            interface = res['interface']
+                        if 'absent_vlans' in res:
+                            absent_vlans = res['absent_vlans']
                         msg += ("{0:30} | {1:20} | {2:15} | {3}\n".format(
-                            res['name'], res['mac'], res['interface'],
-                            [x or 'untagged' for x in res['absent_vlans']]))
+                            name or '-', mac or '-', interface or '-',
+                            [x or 'untagged' for x in absent_vlans]))
                 logger.error(''.join([msg, task['message']]))
 
         # TODO(apanchenko): remove this hack when network verification begins
         # TODO(apanchenko): to work for environments with multiple net groups
-        if MULTIPLE_NETWORKS:
+        if len(self.client.get_nodegroups()) > 1:
             logger.warning('Network verification is temporary disabled when '
                            '"multiple cluster networks" feature is used')
             return
         try:
             task = self.run_network_verify(cluster_id)
-            with quiet_logger():
+            with QuietLogger():
                 if success:
                     self.assert_task_success(task, timeout, interval=10)
                 else:
@@ -1294,22 +1690,32 @@ class FuelWebClient(object):
             raise
 
     @logwrap
-    def update_nodes_interfaces(self, cluster_id, nailgun_nodes=[]):
+    def update_nodes_interfaces(self, cluster_id, nailgun_nodes=None):
+        if nailgun_nodes is None:
+            nailgun_nodes = []
         net_provider = self.client.get_cluster(cluster_id)['net_provider']
         if NEUTRON == net_provider:
             assigned_networks = {
-                'eth1': ['public'],
-                'eth2': ['management'],
-                'eth3': ['private'],
-                'eth4': ['storage'],
+                iface_alias('eth0'): ['fuelweb_admin'],
+                iface_alias('eth1'): ['public'],
+                iface_alias('eth2'): ['management'],
+                iface_alias('eth3'): ['private'],
+                iface_alias('eth4'): ['storage'],
             }
         else:
             assigned_networks = {
-                'eth1': ['public'],
-                'eth2': ['management'],
-                'eth3': ['fixed'],
-                'eth4': ['storage'],
+                iface_alias('eth1'): ['public'],
+                iface_alias('eth2'): ['management'],
+                iface_alias('eth3'): ['fixed'],
+                iface_alias('eth4'): ['storage'],
             }
+
+        baremetal_iface = iface_alias('eth5')
+        if self.get_cluster_additional_components(cluster_id).get(
+                'ironic', False):
+            assigned_networks[baremetal_iface] = ['baremetal']
+
+        logger.info('Assigned networks are: {}'.format(str(assigned_networks)))
 
         if not nailgun_nodes:
             nailgun_nodes = self.client.list_cluster_nodes(cluster_id)
@@ -1317,72 +1723,215 @@ class FuelWebClient(object):
             self.update_node_networks(node['id'], assigned_networks)
 
     @logwrap
-    def update_network_configuration(self, cluster_id, nodegroup=None):
-        net_config = self.client.get_networks(cluster_id)
-        if not nodegroup:
-            logger.info('Update network settings of cluster %s', cluster_id)
-            new_settings = self.update_net_settings(net_config)
-            self.client.update_network(
-                cluster_id=cluster_id,
-                networking_parameters=new_settings["networking_parameters"],
-                networks=new_settings["networks"]
-            )
-        else:
-            logger.info('Update network settings of cluster %s, nodegroup %s',
-                        cluster_id, nodegroup['name'])
-            new_settings = self.update_net_settings(net_config, nodegroup,
-                                                    cluster_id)
-            self.client.update_network(
-                cluster_id=cluster_id,
-                networking_parameters=new_settings["networking_parameters"],
-                networks=new_settings["networks"]
-            )
+    def get_offloading_modes(self, node_id, interfaces):
+        offloading_types = []
+        for i in self.client.get_node_interfaces(node_id):
+            for interface in interfaces:
+                if i['name'] == interface:
+                    for offloading_type in i['offloading_modes']:
+                        offloading_types.append(offloading_type['name'])
+        return offloading_types
 
-    def update_net_settings(self, network_configuration, nodegroup=None,
-                            cluster_id=None):
+    @logwrap
+    def update_offloads(self, node_id, update_values, interface_to_update):
+        interfaces = self.client.get_node_interfaces(node_id)
+
+        for i in interfaces:
+            if i['name'] == interface_to_update:
+                for new_mode in update_values['offloading_modes']:
+                    for mode in i['offloading_modes']:
+                        if mode['name'] == new_mode['name']:
+                            mode.update(new_mode)
+                            break
+                    else:
+                        raise Exception("Offload type '{0}' is not applicable"
+                                        " for interface {1}".format(
+                                            new_mode['name'],
+                                            interface_to_update))
+        self.client.put_node_interfaces(
+            [{'id': node_id, 'interfaces': interfaces}])
+
+    def change_default_network_settings(self):
+        def fetch_networks(networks):
+            """Parse response from api/releases/1/networks and return dict with
+            networks' settings - need for avoiding hardcode"""
+            result = {}
+            for net in networks:
+                if (net['name'] == 'private' and
+                        net.get('seg_type', '') == 'tun'):
+                    result['private_tun'] = net
+                elif (net['name'] == 'private' and
+                      net.get('seg_type', '') == 'gre'):
+                    result['private_gre'] = net
+                elif net['name'] == 'public':
+                    result['public'] = net
+                elif net['name'] == 'management':
+                    result['management'] = net
+                elif net['name'] == 'storage':
+                    result['storage'] = net
+                elif net['name'] == 'baremetal':
+                    result['baremetal'] = net
+            return result
+
+        default_networks = {}
+
+        for n in ('public', 'management', 'storage', 'private'):
+            if self.environment.d_env.get_networks(name=n):
+                default_networks[n] = self.environment.d_env.get_network(
+                    name=n).ip
+
+        logger.info("Applying default network settings")
+        for _release in self.client.get_releases():
+            if (_release['is_deployable'] is False and
+                    _release['state'] != 'available'):
+                logger.info("Release {!r} (version {!r}) is not available for "
+                            "deployment; skipping default network "
+                            "replacement".format(_release['name'],
+                                                 _release['version']))
+                continue
+
+            logger.info(
+                'Applying changes for release: {}'.format(
+                    _release['name']))
+            net_settings = \
+                self.client.get_release_default_net_settings(
+                    _release['id'])
+            for net_provider in NETWORK_PROVIDERS:
+                if net_provider not in net_settings:
+                    continue
+
+                networks = fetch_networks(
+                    net_settings[net_provider]['networks'])
+
+                networks['public']['cidr'] = str(default_networks['public'])
+                networks['public']['gateway'] = str(
+                    default_networks['public'].network + 1)
+                networks['public']['notation'] = 'ip_ranges'
+
+                # use the first half of public network as static public range
+                networks['public']['ip_range'] = self.get_range(
+                    default_networks['public'], ip_range=-1)[0]
+
+                # use the second half of public network as floating range
+                net_settings[net_provider]['config']['floating_ranges'] = \
+                    self.get_range(default_networks['public'], ip_range=1)
+
+                devops_env = self.environment.d_env
+
+                # NOTE(akostrikov) possible break.
+                if 'baremetal' in networks and \
+                        devops_env.get_networks(name='ironic'):
+                    ironic_net = self.environment.d_env.get_network(
+                        name='ironic').ip
+                    prefix = netaddr.IPNetwork(
+                        str(ironic_net.cidr)
+                    ).prefixlen
+                    subnet1, subnet2 = tuple(ironic_net.subnet(prefix + 1))
+                    networks['baremetal']['cidr'] = str(ironic_net)
+                    net_settings[net_provider]['config'][
+                        'baremetal_gateway'] = str(ironic_net[-2])
+                    networks['baremetal']['ip_range'] = [
+                        str(subnet1[2]), str(subnet2[0])]
+                    net_settings[net_provider]['config']['baremetal_range'] =\
+                        [str(subnet2[1]), str(subnet2[-3])]
+                    networks['baremetal']['vlan_start'] = None
+
+                if BONDING:
+                    # leave defaults for mgmt, storage and private if
+                    # BONDING is enabled
+                    continue
+                for net, cidr in default_networks.items():
+                    if net in ('public', 'private'):
+                        continue
+                    networks[net]['cidr'] = str(cidr)
+                    networks[net]['ip_range'] = self.get_range(cidr)[0]
+                    networks[net]['notation'] = 'ip_ranges'
+                    networks[net]['vlan_start'] = None
+
+                if net_provider == 'neutron':
+                    networks['private_tun']['cidr'] = str(
+                        default_networks['private'])
+                    networks['private_gre']['cidr'] = str(
+                        default_networks['private'])
+
+                    net_settings[net_provider]['config']['internal_cidr'] = \
+                        str(default_networks['private'])
+                    net_settings[net_provider]['config']['internal_gateway'] =\
+                        str(default_networks['private'][1])
+
+                elif net_provider == 'nova_network':
+                    net_settings[net_provider]['config'][
+                        'fixed_networks_cidr'] = str(
+                        default_networks['private'])
+
+            self.client.put_release_default_net_settings(
+                _release['id'], net_settings)
+
+    @logwrap
+    def update_nodegroups_network_configuration(self, cluster_id,
+                                                nodegroups=None):
+        net_config = self.client.get_networks(cluster_id)
+        new_settings = net_config
+
+        for nodegroup in nodegroups:
+            logger.info('Update network settings of cluster %s, '
+                        'nodegroup %s', cluster_id, nodegroup['name'])
+            new_settings = self.update_nodegroup_net_settings(new_settings,
+                                                              nodegroup,
+                                                              cluster_id)
+        self.client.update_network(
+            cluster_id=cluster_id,
+            networking_parameters=new_settings["networking_parameters"],
+            networks=new_settings["networks"]
+        )
+
+    @staticmethod
+    def _get_true_net_name(name, net_pools):
+        """Find a devops network name in net_pools"""
+        for net in net_pools:
+            if name in net:
+                return {name: net_pools[net]}
+
+    def update_nodegroup_net_settings(self, network_configuration, nodegroup,
+                                      cluster_id=None):
         seg_type = network_configuration.get('networking_parameters', {}) \
             .get('segmentation_type')
-        if not nodegroup:
-            for net in network_configuration.get('networks'):
+        nodegroup_id = self.get_nodegroup(cluster_id, nodegroup['name'])['id']
+        for net in network_configuration.get('networks'):
+            if net['group_id'] == nodegroup_id:
+                # Do not overwrite default PXE admin network configuration
+                if nodegroup['name'] == 'default' and \
+                   net['name'] == 'fuelweb_admin':
+                    continue
                 self.set_network(net_config=net,
                                  net_name=net['name'],
+                                 net_devices=nodegroup['networks'],
                                  seg_type=seg_type)
+                # For all admin/pxe networks except default use master
+                # node as router
+                # TODO(mstrukov): find way to get admin node networks only
+                if net['name'] != 'fuelweb_admin':
+                    continue
+                for devops_network in self.environment.d_env.get_networks():
+                    if str(devops_network.ip_network) == net['cidr']:
+                        net['gateway'] = \
+                            self.environment.d_env.nodes().\
+                            admin.get_ip_address_by_network_name(
+                                devops_network.name)
+                        logger.info('Set master node ({0}) as '
+                                    'router for admin network '
+                                    'in nodegroup {1}.'.format(
+                                        net['gateway'], nodegroup_id))
+        return network_configuration
 
-            self.common_net_settings(network_configuration)
-            return network_configuration
-        else:
-            nodegroup_id = self.get_nodegroup(cluster_id,
-                                              nodegroup['name'])['id']
-            for net in network_configuration.get('networks'):
-                if net['group_id'] == nodegroup_id:
-                    # Do not overwrite default PXE admin network configuration
-                    if nodegroup['name'] == 'default' and \
-                       net['name'] == 'fuelweb_admin':
-                        continue
-                    self.set_network(net_config=net,
-                                     net_name=net['name'],
-                                     net_pools=nodegroup['pools'],
-                                     seg_type=seg_type)
-
-            self.common_net_settings(network_configuration)
-            return network_configuration
-
-    def common_net_settings(self, network_configuration):
-        nc = network_configuration["networking_parameters"]
-        public = self.environment.d_env.get_network(name="public").ip
-
-        if not BONDING:
-            float_range = public
-        else:
-            float_range = list(public.subnet(new_prefix=27))[0]
-        nc["floating_ranges"] = self.get_range(float_range, 1)
-
-    def set_network(self, net_config, net_name, net_pools=None, seg_type=None):
-        nets_wo_floating = ['public', 'management', 'storage']
-        if seg_type == NEUTRON_SEGMENT['gre']:
+    def set_network(self, net_config, net_name, net_devices=None,
+                    seg_type=None):
+        nets_wo_floating = ['public', 'management', 'storage', 'baremetal']
+        if (seg_type == NEUTRON_SEGMENT['tun'] or
+                seg_type == NEUTRON_SEGMENT['gre']):
             nets_wo_floating.append('private')
 
-        if not net_pools:
+        if not net_devices:
             if not BONDING:
                 if 'floating' == net_name:
                     self.net_settings(net_config, 'public', floating=True)
@@ -1398,23 +1947,14 @@ class FuelWebClient(object):
                     i = nets_wo_floating.index(net_name)
                     self.net_settings(net_config, pub_subnets[i], jbond=True)
         else:
-            def _get_true_net_name(_name):
-                for _net in net_pools:
-                    if _name in _net:
-                        return _net
-
-            public_net = _get_true_net_name('public')
-            admin_net = _get_true_net_name('admin')
-
             if not BONDING:
                 if 'floating' == net_name:
-                    self.net_settings(net_config, public_net, floating=True)
-                elif net_name in nets_wo_floating:
-                    self.net_settings(net_config, _get_true_net_name(net_name))
-                elif net_name in 'fuelweb_admin':
-                    self.net_settings(net_config, admin_net)
+                    self.net_settings(net_config, net_devices['public'],
+                                      floating=True)
+                self.net_settings(net_config, net_devices[net_name])
             else:
-                ip_obj = self.environment.d_env.get_network(name=public_net).ip
+                ip_obj = self.environment.d_env.get_network(
+                    name=net_devices['public']).ip
                 pub_subnets = list(ip_obj.subnet(new_prefix=27))
 
                 if "floating" == net_name:
@@ -1424,32 +1964,50 @@ class FuelWebClient(object):
                     i = nets_wo_floating.index(net_name)
                     self.net_settings(net_config, pub_subnets[i], jbond=True)
                 elif net_name in 'fuelweb_admin':
-                    self.net_settings(net_config, admin_net)
+                    self.net_settings(net_config, net_devices['fuelweb_admin'])
+        if 'ip_ranges' in net_config:
+            if net_config['ip_ranges']:
+                net_config['meta']['notation'] = 'ip_ranges'
 
     def net_settings(self, net_config, net_name, floating=False, jbond=False):
         if jbond:
-            ip_network = net_name
+            if net_config['name'] == 'public':
+                net_config['gateway'] = self.environment.d_env.router('public')
+                ip_network = net_name
+            elif net_config['name'] == 'baremetal':
+                baremetal_net = self.environment.d_env.get_network(
+                    name='ironic').ip_network
+                net_config['gateway'] = str(
+                    list(netaddr.IPNetwork(str(baremetal_net)))[-2])
+                ip_network = baremetal_net
+            else:
+                ip_network = net_name
         else:
-            ip_network = self.environment.d_env.get_network(
-                name=net_name).ip_network
-            if 'admin' in net_name:
-                net_config['ip_ranges'] = self.get_range(ip_network, 2)
-
-        net_config['ip_ranges'] = self.get_range(ip_network, 1) \
-            if floating else self.get_range(ip_network, -1)
+            net_config['vlan_start'] = None
+            if net_config['name'] == 'baremetal':
+                baremetal_net = self.environment.d_env.get_network(
+                    name='ironic').ip_network
+                net_config['gateway'] = str(
+                    list(netaddr.IPNetwork(str(baremetal_net)))[-2])
+                ip_network = baremetal_net
+            else:
+                net_config['gateway'] = self.environment.d_env.router(net_name)
+                ip_network = self.environment.d_env.get_network(
+                    name=net_name).ip_network
 
         net_config['cidr'] = str(ip_network)
 
-        if jbond:
-            if net_config['name'] == 'public':
-                net_config['gateway'] = self.environment.d_env.router('public')
+        if 'admin' in net_config['name']:
+            net_config['ip_ranges'] = self.get_range(ip_network, 2)
+        elif floating:
+            net_config['ip_ranges'] = self.get_range(ip_network, 1)
         else:
-            net_config['vlan_start'] = None
-            net_config['gateway'] = self.environment.d_env.router(net_name)
+            net_config['ip_ranges'] = self.get_range(ip_network, -1)
 
-    def get_range(self, ip_network, ip_range=0):
-        net = list(IPNetwork(ip_network))
-        half = len(net) / 2
+    @staticmethod
+    def get_range(ip_network, ip_range=0):
+        net = list(netaddr.IPNetwork(str(ip_network)))
+        half = len(net) // 2
         if ip_range == 0:
             return [[str(net[2]), str(net[-2])]]
         elif ip_range == 1:
@@ -1458,6 +2016,8 @@ class FuelWebClient(object):
             return [[str(net[2]), str(net[half - 1])]]
         elif ip_range == 2:
             return [[str(net[3]), str(net[half - 1])]]
+        elif ip_range == 3:
+            return [[str(net[half]), str(net[-3])]]
 
     def get_floating_ranges(self, network_set=''):
         net_name = 'public{0}'.format(network_set)
@@ -1465,85 +2025,70 @@ class FuelWebClient(object):
         ip_ranges, expected_ips = [], []
 
         for i in [0, -20, -40]:
+            l = []
             for k in range(11):
-                expected_ips.append(str(net[-12 + i + k]))
+                l.append(str(net[-12 + i + k]))
+            expected_ips.append(l)
             e, s = str(net[-12 + i]), str(net[-2 + i])
             ip_ranges.append([e, s])
 
         return ip_ranges, expected_ips
 
-    def warm_shutdown_nodes(self, devops_nodes):
+    @logwrap
+    def get_nailgun_node_online_status(self, node):
+        return self.client.get_node_by_id(node['id'])['online']
+
+    def get_devops_node_online_status(self, devops_node):
+        return self.get_nailgun_node_online_status(
+            self.get_nailgun_node_by_devops_node(devops_node))
+
+    def warm_shutdown_nodes(self, devops_nodes, timeout=10 * 60):
         logger.info('Shutting down (warm) nodes %s',
                     [n.name for n in devops_nodes])
         for node in devops_nodes:
             logger.debug('Shutdown node %s', node.name)
-            remote = self.get_ssh_for_node(node.name)
-            remote.check_call('/sbin/shutdown -Ph now')
-
+            nailgun_node = self.get_nailgun_node_by_devops_node(node)
+            # TODO: LP1620680
+            self.ssh_manager.check_call(ip=nailgun_node['ip'], sudo=True,
+                                        command='sudo shutdown +1')
         for node in devops_nodes:
-            logger.info('Wait a %s node offline status', node.name)
-            try:
-                wait(
-                    lambda: not self.get_nailgun_node_by_devops_node(node)[
-                        'online'], timeout=60 * 10)
-            except TimeoutError:
-                assert_false(
-                    self.get_nailgun_node_by_devops_node(node)['online'],
-                    'Node {0} has not become '
-                    'offline after warm shutdown'.format(node.name))
+            self.wait_node_is_offline(node, timeout=timeout)
             node.destroy()
 
-    def warm_start_nodes(self, devops_nodes):
+    def warm_start_nodes(self, devops_nodes, timeout=4 * 60):
         logger.info('Starting nodes %s', [n.name for n in devops_nodes])
         for node in devops_nodes:
-            node.create()
-        for node in devops_nodes:
-            try:
-                wait(
-                    lambda: self.get_nailgun_node_by_devops_node(
-                        node)['online'], timeout=60 * 10)
-            except TimeoutError:
-                assert_true(
-                    self.get_nailgun_node_by_devops_node(node)['online'],
-                    'Node {0} has not become online '
-                    'after warm start'.format(node.name))
-            logger.debug('Node {0} became online.'.format(node.name))
+            node.start()
+        self.wait_nodes_get_online_state(devops_nodes, timeout=timeout)
 
-    def warm_restart_nodes(self, devops_nodes):
+    def warm_restart_nodes(self, devops_nodes, timeout=4 * 60):
         logger.info('Reboot (warm restart) nodes %s',
                     [n.name for n in devops_nodes])
-        self.warm_shutdown_nodes(devops_nodes)
-        self.warm_start_nodes(devops_nodes)
+        self.warm_shutdown_nodes(devops_nodes, timeout=timeout)
+        self.warm_start_nodes(devops_nodes, timeout=timeout)
 
-    def cold_restart_nodes(self, devops_nodes):
+    def cold_restart_nodes(self, devops_nodes,
+                           wait_offline=True, wait_online=True,
+                           wait_after_destroy=None, timeout=4 * 60):
         logger.info('Cold restart nodes %s',
                     [n.name for n in devops_nodes])
         for node in devops_nodes:
             logger.info('Destroy node %s', node.name)
             node.destroy()
         for node in devops_nodes:
-            logger.info('Wait a %s node offline status', node.name)
-            try:
-                wait(lambda: not self.get_nailgun_node_by_devops_node(
-                     node)['online'], timeout=60 * 10)
-            except TimeoutError:
-                assert_false(
-                    self.get_nailgun_node_by_devops_node(node)['online'],
-                    'Node {0} has not become offline after '
-                    'cold restart'.format(node.name))
-            logger.info('Start %s node', node.name)
-            node.create()
+            if wait_offline:
+                self.wait_node_is_offline(node, timeout=timeout)
+
+        if wait_after_destroy:
+            time.sleep(wait_after_destroy)
+
         for node in devops_nodes:
-            try:
-                wait(
-                    lambda: self.get_nailgun_node_by_devops_node(
-                        node)['online'], timeout=60 * 10)
-            except TimeoutError:
-                assert_true(
-                    self.get_nailgun_node_by_devops_node(node)['online'],
-                    'Node {0} has not become online'
-                    ' after cold start'.format(node.name))
-        self.environment.sync_time()
+            logger.info('Start %s node', node.name)
+            node.start()
+        if wait_online:
+            for node in devops_nodes:
+                self.wait_node_is_online(node, timeout=timeout)
+            self.environment.sync_time()
 
     @logwrap
     def ip_address_show(self, node_name, interface, namespace=None):
@@ -1555,25 +2100,25 @@ class FuelWebClient(object):
             :rtype: String on None
         """
         try:
-            remote = self.get_ssh_for_node(node_name)
             if namespace:
                 cmd = 'ip netns exec {0} ip -4 ' \
                       '-o address show {1}'.format(namespace, interface)
             else:
-                cmd = 'ip -4 -o address show {1}'.format(interface)
+                cmd = 'ip -4 -o address show {0}'.format(interface)
 
-            ret = remote.check_call(cmd)
-            remote.clear()
+            with self.get_ssh_for_node(node_name) as remote:
+                ret = remote.check_call(cmd)
+
             ip_search = re.search(
                 'inet (?P<ip>\d+\.\d+\.\d+.\d+/\d+).*scope .* '
                 '{0}'.format(interface), ' '.join(ret['stdout']))
             if ip_search is None:
-                    logger.debug("Ip show output does not match in regex. "
-                                 "Current value is None. On node {0} in netns "
-                                 "{1} for interface {2}".format(node_name,
-                                                                namespace,
-                                                                interface))
-                    return None
+                logger.debug("Ip show output does not match in regex. "
+                             "Current value is None. On node {0} in netns "
+                             "{1} for interface {2}".format(node_name,
+                                                            namespace,
+                                                            interface))
+                return None
             return ip_search.group('ip')
         except DevopsCalledProcessError as err:
             logger.error(err)
@@ -1583,11 +2128,10 @@ class FuelWebClient(object):
     def ip_address_del(self, node_name, namespace, interface, ip):
         logger.info('Delete %s ip address of %s interface at %s node',
                     ip, interface, node_name)
-        remote = self.get_ssh_for_node(node_name)
-        remote.check_call(
-            'ip netns exec {0} ip addr'
-            ' del {1} dev {2}'.format(namespace, ip, interface))
-        remote.clear()
+        with self.get_ssh_for_node(node_name) as remote:
+            remote.check_call(
+                'ip netns exec {0} ip addr'
+                ' del {1} dev {2}'.format(namespace, ip, interface))
 
     @logwrap
     def provisioning_cluster_wait(self, cluster_id, progress=None):
@@ -1596,7 +2140,35 @@ class FuelWebClient(object):
         self.assert_task_success(task, progress=progress)
 
     @logwrap
-    def deploy_task_wait(self, cluster_id, progress):
+    def deploy_custom_graph_wait(self,
+                                 cluster_id,
+                                 graph_type,
+                                 node_ids=None,
+                                 tasks=None,
+                                 progress=None):
+        """Deploy custom graph of a given type.
+
+        :param cluster_id: Id of a cluster to deploy
+        :param graph_type: Custom graph type to deploy
+        :param node_ids: Ids of nodes to deploy. None means all
+        :param tasks: list of tasks. None means all
+        :param progress: Progress at which count deployment as a success.
+        """
+        logger.info('Start cluster #{cid} custom type "{type}" '
+                    'graph deployment on nodes: {nodes}. With tasks "{tasks}" '
+                    'None means on all nodes.'.format(
+                        cid=cluster_id,
+                        type=graph_type,
+                        tasks=tasks,
+                        nodes=node_ids
+                    ))
+        task = self.client.deploy_custom_graph(cluster_id,
+                                               graph_type,
+                                               node_ids, tasks)
+        self.assert_task_success(task, progress=progress)
+
+    @logwrap
+    def deploy_task_wait(self, cluster_id, progress=None):
         logger.info('Start cluster #%s deployment', cluster_id)
         task = self.client.deploy_nodes(cluster_id)
         self.assert_task_success(
@@ -1615,63 +2187,95 @@ class FuelWebClient(object):
         self.assert_task_success(task, timeout=50 * 60, interval=30)
 
     @logwrap
-    def wait_nodes_get_online_state(self, nodes, timeout=4 * 60):
-        for node in nodes:
-            logger.info('Wait for %s node online status', node.name)
-            try:
-                wait(lambda:
-                     self.get_nailgun_node_by_devops_node(node)['online'],
-                     timeout=timeout)
-            except TimeoutError:
-                assert_true(
-                    self.get_nailgun_node_by_devops_node(node)['online'],
-                    'Node {0} has not become online'.format(node.name))
-            node = self.get_nailgun_node_by_devops_node(node)
-            assert_true(node['online'],
-                        'Node {0} is online'.format(node['mac']))
+    def delete_env_wait(self, cluster_id, timeout=10 * 60):
+        logger.info('Removing cluster with id={0}'.format(cluster_id))
+        self.client.delete_cluster(cluster_id)
+        tasks = self.client.get_tasks()
+        delete_tasks = [t for t in tasks if t['status']
+                        in ('pending', 'running') and
+                        t['name'] == 'cluster_deletion' and
+                        t['cluster'] == cluster_id]
+        if delete_tasks:
+            for task in delete_tasks:
+                logger.info('Task found: {}'.format(task))
+            task = delete_tasks[0]
+            logger.info('Selected task: {}'.format(task))
+
+            # Task will be removed with the cluster, so we will get 404 error
+            assert_raises(
+                exceptions.NotFound,
+                self.assert_task_success, task, timeout)
+        else:
+            assert 'No cluster_deletion task found!'
 
     @logwrap
-    def wait_mysql_galera_is_up(self, node_names, timeout=30 * 4):
+    def wait_nodes_get_online_state(self, nodes, timeout=4 * 60):
+        for node in nodes:
+            self.wait_node_is_online(node, timeout=timeout)
+
+    @logwrap
+    def wait_cluster_nodes_get_online_state(self, cluster_id,
+                                            timeout=4 * 60):
+        self.wait_nodes_get_online_state(
+            self.client.list_cluster_nodes(cluster_id),
+            timeout=timeout)
+
+    @logwrap
+    def wait_mysql_galera_is_up(self, node_names, timeout=60 * 4):
         def _get_galera_status(_remote):
-            cmd = ("mysql --connect_timeout=5 -sse \"SELECT VARIABLE_VALUE "
-                   "FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME"
-                   " = 'wsrep_ready';\"")
-            result = _remote.execute(cmd)
-            if result['exit_code'] == 0:
-                return ''.join(result['stdout']).strip()
-            else:
-                return ''.join(result['stderr']).strip()
+            get_request = (
+                "mysql --connect_timeout=5 -sse "
+                "\"SELECT VARIABLE_VALUE "
+                "FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME"
+                " = '{}';\"").format
+            result = _remote.execute(get_request('wsrep_ready'))
+            if result.exit_code != 0 or u'ON' not in result.stdout_str:
+                return False
+            result = _remote.execute(get_request('wsrep_connected'))
+            if result.exit_code != 0 or u'ON' not in result.stdout_str:
+                return False
+            result = _remote.execute(get_request('wsrep_cluster_size'))
+            if result.exit_code != 0 or\
+                    int(result.stdout_str) >= len(node_names):
+                return False  # Nodes not connected
+            result = _remote.execute(get_request('wsrep_cluster_status'))
+            return result.exit_code == 0 and\
+                u'Primary'.upper() in result.stdout_str.upper()
+            # PRIMARY (primary group configuration, quorum present)
 
         for node_name in node_names:
-            _ip = self.get_nailgun_node_by_name(node_name)['ip']
-            remote = self.environment.d_env.get_ssh_to_remote(_ip)
-            try:
-                wait(lambda: _get_galera_status(remote) == 'ON',
-                     timeout=timeout)
+            with self.get_ssh_for_node(node_name) as remote:
+                wait(lambda: _get_galera_status(remote),
+                     timeout=timeout,
+                     timeout_msg="MySQL Galera isn't ready on "
+                                 "{0}".format(node_name))
                 logger.info("MySQL Galera is up on {host} node.".format(
-                            host=node_name))
-            except TimeoutError:
-                logger.error("MySQL Galera isn't ready on {0}: {1}"
-                             .format(node_name, _get_galera_status(remote)))
-                raise TimeoutError(
-                    "MySQL Galera isn't ready on {0}: {1}".format(
-                        node_name, _get_galera_status(remote)))
+                    host=node_name))
         return True
+
+    @logwrap
+    def mcollective_nodes_online(self, cluster_id):
+        nodes_uids = set([str(n['id']) for n in
+                          self.client.list_cluster_nodes(cluster_id)])
+        # 'mco find' returns '1' exit code if rabbitmq is not ready
+        out = self.ssh_manager.execute_on_remote(
+            ip=self.ssh_manager.admin_ip,
+            cmd='mco find', assert_ec_equal=[0, 1])['stdout_str']
+        ready_nodes_uids = set(out.split('\n'))
+        unavailable_nodes = nodes_uids - ready_nodes_uids
+        logger.debug('Nodes {0} are not reachable via'
+                     ' mcollective'.format(unavailable_nodes))
+        return not unavailable_nodes
 
     @logwrap
     def wait_cinder_is_up(self, node_names):
         logger.info("Waiting for all Cinder services up.")
         for node_name in node_names:
-            _ip = self.get_nailgun_node_by_name(node_name)['ip']
-            remote = self.environment.d_env.get_ssh_to_remote(_ip)
-            try:
-                wait(lambda: checkers.check_cinder_status(remote),
-                     timeout=300)
-                logger.info("All Cinder services up.")
-            except TimeoutError:
-                logger.error("Cinder services not ready.")
-                raise TimeoutError(
-                    "Cinder services not ready. ")
+            node = self.get_nailgun_node_by_name(node_name)
+            wait(lambda: checkers.check_cinder_status(node['ip']),
+                 timeout=300,
+                 timeout_msg='Cinder services not ready')
+            logger.info("All Cinder services up.")
         return True
 
     def run_ostf_repeatably(self, cluster_id, test_name=None,
@@ -1679,12 +2283,12 @@ class FuelWebClient(object):
         res = []
         passed_count = []
         failed_count = []
-        test_nama_to_ran = test_name or OSTF_TEST_NAME
-        retr = test_retries or OSTF_TEST_RETRIES_COUNT
-        test_path = map_ostf.OSTF_TEST_MAPPING.get(test_nama_to_ran)
+        test_name_to_run = test_name or OSTF_TEST_NAME
+        retries = test_retries or OSTF_TEST_RETRIES_COUNT
+        test_path = ostf_test_mapping.OSTF_TEST_MAPPING.get(test_name_to_run)
         logger.info('Test path is {0}'.format(test_path))
 
-        for i in range(0, retr):
+        for _ in range(retries):
             result = self.run_single_ostf_test(
                 cluster_id=cluster_id, test_sets=['smoke', 'sanity'],
                 test_name=test_path,
@@ -1694,12 +2298,11 @@ class FuelWebClient(object):
 
         logger.info('full res is {0}'.format(res))
         for element in res:
-            [passed_count.append(test)
-             for test in element if test.get(test_name) == 'success']
-            [failed_count.append(test)
-             for test in element if test.get(test_name) == 'failure']
-            [failed_count.append(test)
-             for test in element if test.get(test_name) == 'error']
+            for test in element:
+                if test.get(test_name) == 'success':
+                    passed_count.append(test)
+                elif test.get(test_name) in {'failure', 'error'}:
+                    failed_count.append(test)
 
         if not checks:
             assert_true(
@@ -1710,13 +2313,14 @@ class FuelWebClient(object):
             return failed_count
 
     def get_nailgun_version(self):
-        logger.info("ISO version: %s" % self.client.get_api_version())
+        logger.info("ISO version: {}".format(pretty_log(
+            self.client.get_api_version(), indent=1)))
 
     @logwrap
     def run_ceph_task(self, cluster_id, offline_nodes):
         ceph_id = [n['id'] for n in self.client.list_cluster_nodes(cluster_id)
-                   if 'ceph-osd'
-                      in n['roles'] and n['id'] not in offline_nodes]
+                   if 'ceph-osd' in n['roles'] and
+                   n['id'] not in offline_nodes]
         res = self.client.put_deployment_tasks_for_cluster(
             cluster_id, data=['top-role-ceph-osd'],
             node_id=str(ceph_id).strip('[]'))
@@ -1739,7 +2343,7 @@ class FuelWebClient(object):
             if ceph.is_clock_skew(remote):
                 skewed = ceph.get_node_fqdns_w_clock_skew(remote)
                 logger.warning("Time on nodes {0} are to be "
-                               "re-syncronized".format(skewed))
+                               "re-synchronized".format(skewed))
                 nodes_to_sync = [
                     n for n in online_ceph_nodes
                     if n['fqdn'].split('.')[0] in skewed]
@@ -1765,7 +2369,8 @@ class FuelWebClient(object):
                                      "on node %s", fqdn)
                         ceph.restart_monitor(remote_to_mon)
 
-                wait(lambda: not ceph.is_clock_skew(remote), timeout=120)
+                wait(lambda: not ceph.is_clock_skew(remote), timeout=120,
+                     timeout_msg='check ceph time skew timeout')
 
     @logwrap
     def check_ceph_status(self, cluster_id, offline_nodes=(),
@@ -1777,43 +2382,41 @@ class FuelWebClient(object):
 
         logger.info('Waiting until Ceph service become up...')
         for node in online_ceph_nodes:
-            remote = self.environment.d_env.get_ssh_to_remote(node['ip'])
-            try:
+            with self.environment.d_env\
+                    .get_ssh_to_remote(node['ip']) as remote:
+
                 wait(lambda: ceph.check_service_ready(remote) is True,
-                     interval=20, timeout=600)
-            except TimeoutError:
-                error_msg = 'Ceph service is not properly started' \
-                            ' on {0}'.format(node['name'])
-                logger.error(error_msg)
-                raise TimeoutError(error_msg)
+                     interval=20, timeout=600,
+                     timeout_msg='Ceph service is not properly started'
+                                 ' on {0}'.format(node['name']))
 
         logger.info('Ceph service is ready. Checking Ceph Health...')
         self.check_ceph_time_skew(cluster_id, offline_nodes)
 
         node = online_ceph_nodes[0]
-        remote = self.environment.d_env.get_ssh_to_remote(node['ip'])
-        if not ceph.is_health_ok(remote):
-            if ceph.is_pgs_recovering(remote) and len(offline_nodes) > 0:
-                logger.info('Ceph is being recovered after osd node(s)'
-                            ' shutdown.')
-                try:
-                    wait(lambda: ceph.is_health_ok(remote),
-                         interval=30, timeout=recovery_timeout)
-                except TimeoutError:
-                    result = ceph.health_detail(remote)
-                    msg = 'Ceph HEALTH is not OK on {0}. Details: {1}'.format(
-                        node['name'], result)
-                    logger.error(msg)
-                    raise TimeoutError(msg)
-        else:
-            result = ceph.health_detail(remote)
-            msg = 'Ceph HEALTH is not OK on {0}. Details: {1}'.format(
-                node['name'], result)
-            assert_true(ceph.is_health_ok(remote), msg)
+        with self.environment.d_env.get_ssh_to_remote(node['ip']) as remote:
+            if not ceph.is_health_ok(remote):
+                if ceph.is_pgs_recovering(remote) and len(offline_nodes) > 0:
+                    logger.info('Ceph is being recovered after osd node(s)'
+                                ' shutdown.')
+                    try:
+                        wait(lambda: ceph.is_health_ok(remote),
+                             interval=30, timeout=recovery_timeout)
+                    except TimeoutError:
+                        result = ceph.health_detail(remote)
+                        msg = 'Ceph HEALTH is not OK on {0}. Details: {1}'\
+                            .format(node['name'], result)
+                        logger.error(msg)
+                        raise TimeoutError(msg)
+            else:
+                result = ceph.health_detail(remote)
+                msg = 'Ceph HEALTH is not OK on {0}. Details: {1}'.format(
+                    node['name'], result)
+                assert_true(ceph.is_health_ok(remote), msg)
 
-        logger.info('Checking Ceph OSD Tree...')
-        ceph.check_disks(remote, [n['id'] for n in online_ceph_nodes])
-        remote.clear()
+            logger.info('Checking Ceph OSD Tree...')
+            ceph.check_disks(remote, [n['id'] for n in online_ceph_nodes])
+
         logger.info('Ceph cluster status is OK')
 
     @logwrap
@@ -1830,6 +2433,21 @@ class FuelWebClient(object):
                 if release_name in release['name'].lower():
                     release_ids.append(release['id'])
         return release_ids
+
+    @logwrap
+    def get_next_deployable_release_id(self, release_id):
+        releases = self.client.get_releases()
+        release_details = self.client.get_release(release_id)
+
+        for release in releases:
+            if (release["id"] > release_id and
+                    release["operating_system"] ==
+                    release_details["operating_system"] and
+                    release["is_deployable"] and
+                    OPENSTACK_RELEASE in release["name"].lower()):
+                return release["id"]
+
+        return None
 
     @logwrap
     def update_cluster(self, cluster_id, data):
@@ -1855,78 +2473,48 @@ class FuelWebClient(object):
                          'Nailgun node status is not ready but {0}'.format(
                              nailgun_node['status']))
 
+    @staticmethod
     @logwrap
-    def manual_rollback(self, remote, rollback_version):
-        remote.execute('rm /etc/supervisord.d/current')
-        remote.execute('ln -s /etc/supervisord.d/{0}/ '
-                       '/etc/supervisord.d/current'.format(rollback_version))
-        remote.execute('rm /etc/fuel/version.yaml')
-        remote.execute('ln -s /etc/fuel/{0}/version.yaml '
-                       '/etc/fuel/version.yaml'.format(rollback_version))
-        remote.execute('rm /var/www/nailgun/bootstrap')
-        remote.execute('ln -s /var/www/nailgun/{}_bootstrap '
-                       '/var/www/nailgun/bootstrap'.format(rollback_version))
-        logger.debug('stopping supervisor')
-        try:
-            remote.execute('/etc/init.d/supervisord stop')
-        except Exception as e:
-            logger.debug('exception is {0}'.format(e))
-        logger.debug('stop docker')
-        try:
-            remote.execute('docker stop $(docker ps -q)')
-        except Exception as e:
-            logger.debug('exception is {0}'.format(e))
-        logger.debug('start supervisor')
-        time.sleep(60)
-        try:
-            remote.execute('/etc/init.d/supervisord start')
-        except Exception as e:
-            logger.debug('exception is {0}'.format(e))
-        time.sleep(60)
+    def modify_python_file(remote, modification, filename):
+        remote.execute('sed -i "{0}" {1}'.format(modification, filename))
+
+    @staticmethod
+    def backup_master(remote):
+        # FIXME(kozhukalov): This approach is outdated
+        # due to getting rid of docker containers.
+        logger.info("Backup of the master node is started.")
+        remote.check_call(
+            "echo CALC_MY_MD5SUM > /etc/fuel/data",
+            error_info='command calc_my_mdsum failed')
+        remote.check_call(
+            "iptables-save > /etc/fuel/iptables-backup",
+            error_info='can not save iptables in iptables-backup')
+        remote.check_call(
+            "md5sum /etc/fuel/data | cut -d' ' -f1 > /etc/fuel/sum",
+            error_info='failed to create sum file')
+        remote.check_call('dockerctl backup')
+        remote.check_call(
+            'rm -f /etc/fuel/data',
+            error_info='Can not remove /etc/fuel/data')
+        logger.info("Backup of the master node is complete.")
 
     @logwrap
-    def modify_python_file(self, remote, modification, file):
-        remote.execute('sed -i "{0}" {1}'.format(modification, file))
-
-    def backup_master(self, remote):
-        logger.debug("Start backup of master node")
-        assert_equal(
-            0, remote.execute(
-                "echo CALC_MY_MD5SUM > /etc/fuel/data")['exit_code'],
-            'command calc_my_mdsum failed')
-        assert_equal(
-            0, remote.execute(
-                "iptables-save > /etc/fuel/iptables-backup")['exit_code'],
-            'can not save iptables in iptables-backup')
-
-        assert_equal(0, remote.execute(
-            "md5sum /etc/fuel/data | sed -n 1p | "
-            "awk '{print $1}'>/etc/fuel/sum")['exit_code'],
-            'failed to create sum file')
-
-        assert_equal(0, remote.execute('dockerctl backup')['exit_code'],
-                     'dockerctl backup failed with non zero exit code')
-
-        assert_equal(0, remote.execute('rm -f /etc/fuel/data')['exit_code'],
-                     'Can not remove /etc/fuel/data')
-        logger.debug("Finish backup of master node")
+    def restore_master(self, ip):
+        # FIXME(kozhukalov): This approach is outdated
+        # due to getting rid of docker containers.
+        logger.info("Restore of the master node is started.")
+        path = checkers.find_backup(ip)
+        self.ssh_manager.execute_on_remote(
+            ip=ip,
+            cmd='dockerctl restore {0}'.format(path))
+        logger.info("Restore of the master node is complete.")
 
     @logwrap
-    def restore_master(self, remote):
-        logger.debug("Start restore master node")
-        path = checkers.find_backup(remote)
-        assert_equal(
-            0,
-            remote.execute('dockerctl restore {0}'.format(path))['exit_code'],
-            'dockerctl restore finishes with non-zero exit code')
-        logger.debug("Finish restore master node")
-
-    @logwrap
-    def restore_check_nailgun_api(self, remote):
+    def restore_check_nailgun_api(self):
         logger.info("Restore check nailgun api")
         info = self.client.get_api_version()
-        build_number = info["build_number"]
-        assert_true(build_number, 'api version returned empty data')
+        os_version = info["openstack_version"]
+        assert_true(os_version, 'api version returned empty data')
 
     @logwrap
     def get_nailgun_cidr_nova(self, cluster_id):
@@ -1954,18 +2542,22 @@ class FuelWebClient(object):
         elif net_provider == 'neutron':
             nailgun_cidr = self.get_nailgun_cidr_neutron(cluster_id)
             logger.debug('nailgun cidr is {0}'.format(nailgun_cidr))
-            subnet = os_conn.get_subnet('net04__subnet')
-            logger.debug('net04__subnet: {0}'.format(
+            private_net_name = self.get_cluster_predefined_networks_name(
+                cluster_id)['private_net']
+            subnet = os_conn.get_subnet('{0}__subnet'.format(private_net_name))
+            logger.debug('subnet of pre-defined fixed network: {0}'.format(
                 subnet))
-            assert_true(subnet, "net04__subnet does not exists")
-            logger.debug('cidr net04__subnet: {0}'.format(
-                subnet['cidr']))
+            assert_true(subnet, '{0}__subnet does not exists'.format(
+                private_net_name))
+            logger.debug('cidr {0}__subnet: {1}'.format(
+                private_net_name, subnet['cidr']))
             assert_equal(nailgun_cidr, subnet['cidr'].rstrip(),
                          'Cidr after deployment is not equal'
                          ' to cidr by default')
 
+    @staticmethod
     @logwrap
-    def check_fixed_nova_splited_cidr(self, os_conn, nailgun_cidr, remote):
+    def check_fixed_nova_splited_cidr(os_conn, nailgun_cidr):
         logger.debug('Nailgun cidr for nova: {0}'.format(nailgun_cidr))
 
         subnets_list = [net.cidr for net in os_conn.get_nova_network_list()]
@@ -1975,7 +2567,8 @@ class FuelWebClient(object):
         for subnet in subnets_list:
             logger.debug("Check that subnet {0} is part of network {1}"
                          .format(subnet, nailgun_cidr))
-            assert_true(IPNetwork(subnet) in IPNetwork(nailgun_cidr),
+            assert_true(netaddr.IPNetwork(str(subnet)) in
+                        netaddr.IPNetwork(str(nailgun_cidr)),
                         'Something goes wrong. Seems subnet {0} is out '
                         'of net {1}'.format(subnet, nailgun_cidr))
 
@@ -1987,7 +2580,8 @@ class FuelWebClient(object):
         for subnet1, subnet2 in subnets_pairs:
             logger.debug("Check if the subnet {0} is part of the subnet {1}"
                          .format(subnet1, subnet2))
-            assert_true(IPNetwork(subnet1) not in IPNetwork(subnet2),
+            assert_true(netaddr.IPNetwork(str(subnet1)) not in
+                        netaddr.IPNetwork(str(subnet2)),
                         "Subnet {0} is part of subnet {1}"
                         .format(subnet1, subnet2))
 
@@ -2022,7 +2616,8 @@ class FuelWebClient(object):
 
     def get_public_vip(self, cluster_id):
         if self.get_cluster_mode(cluster_id) == DEPLOYMENT_MODE_HA:
-            return self.client.get_networks(cluster_id)['public_vip']
+            return self.client.get_networks(
+                cluster_id)['vips']['public']['ipaddr']
         else:
             logger.error("Public VIP for cluster '{0}' not found, searching "
                          "for public IP on the controller".format(cluster_id))
@@ -2032,10 +2627,15 @@ class FuelWebClient(object):
 
     def get_management_vrouter_vip(self, cluster_id):
         return self.client.get_networks(
-            cluster_id)['management_vrouter_vip']
+            cluster_id)['vips']['vrouter']['ipaddr']
 
     def get_mgmt_vip(self, cluster_id):
-        return self.client.get_networks(cluster_id)['management_vip']
+        return self.client.get_networks(
+            cluster_id)['vips']['management']['ipaddr']
+
+    def get_public_vrouter_vip(self, cluster_id):
+        return self.client.get_networks(
+            cluster_id)['vips']['vrouter_pub']['ipaddr']
 
     @logwrap
     def get_controller_with_running_service(self, slave, service_name):
@@ -2048,18 +2648,17 @@ class FuelWebClient(object):
             fqdn, self.environment.d_env.nodes().slaves)
         return devops_node
 
+    @staticmethod
     @logwrap
-    def get_fqdn_by_hostname(self, hostname):
-        if DNS_SUFFIX not in hostname:
-            hostname += DNS_SUFFIX
-            return hostname
-        else:
-            return hostname
+    def get_fqdn_by_hostname(hostname):
+        return (
+            hostname + DNS_SUFFIX if DNS_SUFFIX not in hostname else hostname
+        )
 
     def get_nodegroup(self, cluster_id, name='default', group_id=None):
         ngroups = self.client.get_nodegroups()
         for group in ngroups:
-            if group['cluster'] == cluster_id and group['name'] == name:
+            if group['cluster_id'] == cluster_id and group['name'] == name:
                 if group_id and group['id'] != group_id:
                     continue
                 return group
@@ -2077,15 +2676,15 @@ class FuelWebClient(object):
     @logwrap
     def get_nailgun_primary_node(self, slave, role='primary-controller'):
         # returns controller or mongo that is primary in nailgun
-        remote = self.get_ssh_for_node(slave.name)
-        data = yaml.load(''.join(
-            remote.execute('cat /etc/astute.yaml')['stdout']))
-        node_name = [node['fqdn'] for node in data['nodes']
-                     if node['role'] == role][0]
+        with self.get_ssh_for_node(slave.name) as remote:
+            with remote.open('/etc/astute.yaml') as f:
+                data = yaml.safe_load(f)
+        nodes = data['network_metadata']['nodes']
+        node_name = [node['fqdn'] for node in nodes.values()
+                     if role in node['node_roles']][0]
         logger.debug("node name is {0}".format(node_name))
         fqdn = self.get_fqdn_by_hostname(node_name)
-        devops_node = self.find_devops_node_by_nailgun_fqdn(
-            fqdn, self.environment.d_env.nodes().slaves)
+        devops_node = self.get_devops_node_by_nailgun_fqdn(fqdn)
         return devops_node
 
     @logwrap
@@ -2107,18 +2706,95 @@ class FuelWebClient(object):
         attr = self.client.get_cluster_attributes(cluster_id)[section]
         return plugin_name in attr
 
+    @logwrap
+    def list_cluster_enabled_plugins(self, cluster_id):
+        enabled_plugins = []
+        all_plugins = self.client.plugins_list()
+        cl_attrib = self.client.get_cluster_attributes(cluster_id)
+        for plugin in all_plugins:
+            plugin_name = plugin['name']
+            if plugin_name in cl_attrib['editable']:
+                if cl_attrib['editable'][plugin_name]['metadata']['enabled']:
+                    enabled_plugins.append(plugin)
+                    logger.info('{} plugin is enabled '
+                                'in cluster id={}'.format(plugin_name,
+                                                          cluster_id))
+        return enabled_plugins
+
     def update_plugin_data(self, cluster_id, plugin_name, data):
         attr = self.client.get_cluster_attributes(cluster_id)
+        # Do not re-upload anything, except selected plugin data
+        plugin_attributes = {
+            'editable': {plugin_name: attr['editable'][plugin_name]}}
+
         for option, value in data.items():
-            plugin_data = attr['editable'][plugin_name]
+            plugin_data = plugin_attributes['editable'][plugin_name]
+            path = option.split("/")
+            """Key 'metadata' can be in section
+            plugin_data['metadata']['versions']
+            For enable/disable plugin value must be set in
+            plugin_data['metadata']['enabled']
+            """
+            if 'metadata' in path:
+                plugin_data['metadata'][path[-1]] = value
+            elif 'versions' in plugin_data['metadata']:
+                for version in plugin_data['metadata']['versions']:
+                    for p in path[:-1]:
+                        version = version[p]
+                    version[path[-1]] = value
+            else:
+                for p in path[:-1]:
+                    plugin_data = plugin_data[p]
+                plugin_data[path[-1]] = value
+        self.client.update_cluster_attributes(cluster_id, plugin_attributes)
+
+    def get_plugin_data(self, cluster_id, plugin_name, version):
+        """Return data (settings) for specified version of plugin
+
+        :param cluster_id: int
+        :param plugin_name: string
+        :param version: string
+        :return: dict
+        """
+        attr = self.client.get_cluster_attributes(cluster_id)
+        plugin_data = attr['editable'][plugin_name]
+        plugin_versions = plugin_data['metadata']['versions']
+        for p in plugin_versions:
+            if p['metadata']['plugin_version'] == version:
+                return p
+        raise AssertionError("Plugin {0} version {1} is not "
+                             "found".format(plugin_name, version))
+
+    def update_plugin_settings(self, cluster_id, plugin_name, version, data,
+                               enabled=True):
+        """Update settings for specified version of plugin
+
+        :param plugin_name: string
+        :param version: string
+        :param data: dict - settings for the plugin
+        :return: None
+        """
+        attr = self.client.get_cluster_attributes(cluster_id)
+        plugin_versions = attr['editable'][plugin_name]['metadata']['versions']
+        if enabled:
+            attr['editable'][plugin_name]['metadata']['enabled'] = True
+        plugin_data = None
+        for item in plugin_versions:
+            if item['metadata']['plugin_version'] == version:
+                plugin_data = item
+                break
+        assert_true(plugin_data is not None, "Plugin {0} version {1} is not "
+                    "found".format(plugin_name, version))
+        for option, value in data.items():
             path = option.split("/")
             for p in path[:-1]:
-                plugin_data = plugin_data[p]
-            plugin_data[path[-1]] = value
+                plugin_settings = plugin_data[p]
+            plugin_settings[path[-1]] = value
         self.client.update_cluster_attributes(cluster_id, attr)
 
+    @staticmethod
     @logwrap
-    def prepare_ceph_to_delete(self, remote_ceph):
+    def prepare_ceph_to_delete(remote_ceph):
         hostname = ''.join(remote_ceph.execute(
             "hostname -s")['stdout']).strip()
         osd_tree = ceph.get_osd_tree(remote_ceph)
@@ -2130,18 +2806,24 @@ class FuelWebClient(object):
 
         logger.debug("ids are {}".format(ids))
         assert_true(ids, "osd ids for {} weren't found".format(hostname))
-        for id in ids:
-            remote_ceph.execute("ceph osd out {}".format(id))
+        for osd_id in ids:
+            remote_ceph.execute("ceph osd out {}".format(osd_id))
         wait(lambda: ceph.is_health_ok(remote_ceph),
-             interval=30, timeout=10 * 60)
-        for id in ids:
+             interval=30, timeout=10 * 60,
+             timeout_msg='ceph helth ok timeout')
+        for osd_id in ids:
             if OPENSTACK_RELEASE_UBUNTU in OPENSTACK_RELEASE:
-                remote_ceph.execute("stop ceph-osd id={}".format(id))
+                if UBUNTU_SERVICE_PROVIDER == 'systemd':
+                    remote_ceph.execute("systemctl stop ceph-osd@{}"
+                                        .format(osd_id))
+                else:
+                    remote_ceph.execute("stop ceph-osd id={}"
+                                        .format(osd_id))
             else:
-                remote_ceph.execute("service ceph stop osd.{}".format(id))
-            remote_ceph.execute("ceph osd crush remove osd.{}".format(id))
-            remote_ceph.execute("ceph auth del osd.{}".format(id))
-            remote_ceph.execute("ceph osd rm osd.{}".format(id))
+                remote_ceph.execute("service ceph stop osd.{}".format(osd_id))
+            remote_ceph.execute("ceph osd crush remove osd.{}".format(osd_id))
+            remote_ceph.execute("ceph auth del osd.{}".format(osd_id))
+            remote_ceph.execute("ceph osd rm osd.{}".format(osd_id))
         # remove ceph node from crush map
         remote_ceph.execute("ceph osd crush remove {}".format(hostname))
 
@@ -2171,9 +2853,10 @@ class FuelWebClient(object):
             cluster_id=cluster_id, data=tasks,
             node_id=','.join(map(str, nodes)))
         tasks = self.client.get_tasks()
-        deploy_tasks = [t for t in tasks if t['status'] == 'running'
-                        and t['name'] == 'deployment'
-                        and t['cluster'] == cluster_id]
+        deploy_tasks = [t for t in tasks if t['status']
+                        in ('pending', 'running') and
+                        t['name'] == 'deployment' and
+                        t['cluster'] == cluster_id]
         for task in deploy_tasks:
             if min([t['progress'] for t in deploy_tasks]) == task['progress']:
                 return task
@@ -2192,17 +2875,17 @@ class FuelWebClient(object):
                                   cluster_id,
                                   roles=['controller', ]) if node['online']]
 
-        admin_remote = self.environment.d_env.get_admin_remote()
-        check_proxy_cmd = ('[[ $(curl -s -w "%{{http_code}}" '
-                           '{0} -o /dev/null) -eq 200 ]]')
+        with self.environment.d_env.get_admin_remote() as admin_remote:
+            check_proxy_cmd = ('[[ $(curl -s -w "%{{http_code}}" '
+                               '{0} -o /dev/null) -eq 200 ]]')
 
-        for controller in online_controllers:
-            proxy_url = 'http://{0}:{1}/'.format(controller['ip'], port)
-            logger.debug('Trying to connect to {0} from master node...'.format(
-                proxy_url))
-            if admin_remote.execute(
-                    check_proxy_cmd.format(proxy_url))['exit_code'] == 0:
-                return proxy_url
+            for controller in online_controllers:
+                proxy_url = 'http://{0}:{1}/'.format(controller['ip'], port)
+                logger.debug('Trying to connect to {0} from master node...'
+                             .format(proxy_url))
+                if admin_remote.execute(
+                        check_proxy_cmd.format(proxy_url))['exit_code'] == 0:
+                    return proxy_url
 
         assert_true(len(online_controllers) > 0,
                     'There are no online controllers available '
@@ -2222,3 +2905,442 @@ class FuelWebClient(object):
         return {'username': username,
                 'password': password,
                 'tenant': tenant}
+
+    @logwrap
+    def get_cluster_additional_components(self, cluster_id):
+        components = {}
+        attributes = self.client.get_cluster_attributes(cluster_id)
+        add_comps = attributes['editable']['additional_components'].items()
+        for comp, opts in add_comps:
+            # exclude metadata
+            if 'metadata' not in comp:
+                components[comp] = opts['value']
+        return components
+
+    @logwrap
+    def get_cluster_ibp_packages(self, cluster_id):
+        attributes = self.client.get_cluster_attributes(cluster_id)
+        pkgs = attributes['editable']['provision']['packages']['value']
+        return set(pkgs.splitlines())
+
+    @logwrap
+    def update_cluster_ibp_packages(self, cluster_id, pkgs):
+        attributes = self.client.get_cluster_attributes(cluster_id)
+        attributes['editable']['provision']['packages']['value'] = '\n'.join(
+            pkgs)
+        self.client.update_cluster_attributes(cluster_id, attributes)
+        return self.get_cluster_ibp_packages(cluster_id)
+
+    @logwrap
+    def spawn_vms_wait(self, cluster_id, timeout=60 * 60, interval=30):
+        logger.info('Spawn VMs of a cluster %s', cluster_id)
+        task = self.client.spawn_vms(cluster_id)
+        self.assert_task_success(task, timeout=timeout, interval=interval)
+
+    @logwrap
+    def get_all_ostf_set_names(self, cluster_id):
+        sets = self.fuel_client.ostf.get_test_sets(cluster_id=cluster_id)
+        return [s['id'] for s in sets]
+
+    @logwrap
+    def update_network_cidr(self, cluster_id, network_name):
+        """Simple method for changing default network cidr
+        (just use its subnet with 2x smaller network mask)
+
+        :param cluster_id: int
+        :param network_name: str
+        :return: None
+        """
+        networks = self.client.get_networks(cluster_id)['networks']
+        params = self.client.get_networks(cluster_id)['networking_parameters']
+        for network in networks:
+            if network['name'] != network_name:
+                continue
+            old_cidr = netaddr.IPNetwork(str(network['cidr']))
+            new_cidr = list(old_cidr.subnet(old_cidr.prefixlen + 1))[0]
+            assert_not_equal(old_cidr, new_cidr,
+                             'Can\t create a subnet using default cidr {0} '
+                             'for {1} network!'.format(old_cidr, network_name))
+            network['cidr'] = str(new_cidr)
+            logger.debug('CIDR for {0} network was changed from {1} to '
+                         '{2}.'.format(network_name, old_cidr, new_cidr))
+            if network['meta']['notation'] != 'ip_ranges':
+                continue
+            if network['name'] == 'public':
+                network['ip_ranges'] = self.get_range(new_cidr, ip_range=-1)
+                params['floating_ranges'] = self.get_range(new_cidr,
+                                                           ip_range=1)
+            else:
+                network['ip_ranges'] = self.get_range(new_cidr, ip_range=0)
+        self.client.update_network(cluster_id, params, networks)
+
+    @logwrap
+    def wait_task_success(self, task_name='', interval=30,
+                          timeout=help_data.DEPLOYMENT_TIMEOUT):
+        """Wait provided task to finish
+
+        :param task_name: str
+        :param interval: int
+        :param timeout: int
+        :return: None
+        """
+        all_tasks = self.client.get_tasks()
+        tasks = [task for task in all_tasks if task['name'] == task_name]
+        latest_task = sorted(tasks, key=lambda k: k['id'])[-1]
+        self.assert_task_success(latest_task, interval=interval,
+                                 timeout=timeout)
+
+    def deploy_cluster_changes_wait(
+            self, cluster_id, data=None,
+            timeout=help_data.DEPLOYMENT_TIMEOUT,
+            interval=30):
+        """Redeploy cluster to apply changes in its settings
+
+        :param cluster_id: int, env ID to apply changes for
+        :param data: dict, changed env settings
+        :param timeout: int, time (in seconds) to wait for deployment end
+        :param interval: int, time (in seconds) between deployment
+                              status queries
+        :return:
+        """
+        logger.info('Re-deploy cluster {} to apply the changed '
+                    'settings'.format(cluster_id))
+        if data is None:
+            data = {}
+        task = self.client.redeploy_cluster_changes(cluster_id, data)
+        self.assert_task_success(task, interval=interval, timeout=timeout)
+
+    def execute_task_on_node(self, task_name, node_id,
+                             cluster_id, force_exception=False,
+                             force_execution=True):
+        """Execute deployment task against the corresponding node
+
+        :param task_name: str, name of a task to execute
+        :param node_id: int, node ID to execute task on
+        :param cluster_id: int, cluster ID
+        :param force_exception: bool, indication whether exceptions on task
+               execution are ignored
+        :param force_execution: bool, run particular task on nodes
+               and do not care if there were changes or not
+        :return: None
+        """
+        try:
+            logger.info("Trying to execute {!r} task on node {!r}"
+                        .format(task_name, node_id))
+            task = self.client.put_deployment_tasks_for_cluster(
+                cluster_id=cluster_id,
+                data=[task_name],
+                node_id=node_id,
+                force=force_execution)
+            self.assert_task_success(task, timeout=30 * 60)
+        except (AssertionError, TimeoutError):
+            logger.exception("Failed to run task {!r}".format(task_name))
+            if force_exception:
+                raise
+
+    def get_network_pool(self, pool_name, group_name=None):
+        net = self.environment.d_env.get_network(name=pool_name)
+
+        _net_pool = {
+            "gateway": net.default_gw,
+            "network": net.ip_network
+        }
+        return _net_pool
+
+
+class FuelWebClient30(FuelWebClient29):
+    """FuelWebClient that works with fuel-devops 3.0
+    """
+    @logwrap
+    def get_default_node_group(self):
+        return self.environment.d_env.get_group(name='default')
+
+    @logwrap
+    def get_public_gw(self):
+        default_node_group = self.get_default_node_group()
+        pub_pool = default_node_group.get_network_pool(name='public')
+        return str(pub_pool.gateway)
+
+    @logwrap
+    def nodegroups_configure(self, cluster_id):
+        # Add node groups with networks
+        if len(self.environment.d_env.get_groups()) > 1:
+            ng = {rack.name: [] for rack in
+                  self.environment.d_env.get_groups()}
+            ng_nets = []
+            for rack in self.environment.d_env.get_groups():
+                nets = {
+                    'name': rack.name,
+                    'networks': {
+                        r.name: r.address_pool.name
+                        for r in rack.get_network_pools(
+                            name__in=[
+                                'fuelweb_admin',
+                                'public',
+                                'management',
+                                'storage',
+                                'private'])}}
+                ng_nets.append(nets)
+            self.update_nodegroups(cluster_id=cluster_id,
+                                   node_groups=ng)
+            self.update_nodegroups_network_configuration(cluster_id,
+                                                         ng_nets)
+
+    def change_default_network_settings(self):
+        def fetch_networks(networks):
+            """Parse response from api/releases/1/networks and return dict with
+            networks' settings - need for avoiding hardcode"""
+            result = {}
+            for net in networks:
+                if (net['name'] == 'private' and
+                        net.get('seg_type', '') == 'tun'):
+                    result['private_tun'] = net
+                elif (net['name'] == 'private' and
+                        net.get('seg_type', '') == 'gre'):
+                    result['private_gre'] = net
+                elif (net['name'] == 'private' and
+                        net.get('seg_type', '') == 'vlan'):
+                    result['private_vlan'] = net
+                elif net['name'] == 'public':
+                    result['public'] = net
+                elif net['name'] == 'management':
+                    result['management'] = net
+                elif net['name'] == 'storage':
+                    result['storage'] = net
+                elif net['name'] == 'baremetal':
+                    result['baremetal'] = net
+            return result
+
+        default_node_group = self.get_default_node_group()
+        logger.info("Default node group has {} name".format(
+            default_node_group.name))
+
+        logger.info("Applying default network settings")
+        for _release in self.client.get_releases():
+            logger.info(
+                'Applying changes for release: {}'.format(
+                    _release['name']))
+            net_settings = \
+                self.client.get_release_default_net_settings(
+                    _release['id'])
+            for net_provider in NETWORK_PROVIDERS:
+                if net_provider not in net_settings:
+                    # TODO(ddmitriev): should show warning if NETWORK_PROVIDERS
+                    # are not match providers in net_settings.
+                    continue
+
+                networks = fetch_networks(
+                    net_settings[net_provider]['networks'])
+
+                pub_pool = default_node_group.get_network_pool(
+                    name='public')
+                networks['public']['cidr'] = str(pub_pool.net)
+                networks['public']['gateway'] = str(pub_pool.gateway)
+                networks['public']['notation'] = 'ip_ranges'
+                networks['public']['vlan_start'] = \
+                    pub_pool.vlan_start if pub_pool.vlan_start else None
+
+                networks['public']['ip_range'] = list(
+                    pub_pool.ip_range(relative_start=2, relative_end=-16))
+
+                net_settings[net_provider]['config']['floating_ranges'] = [
+                    list(pub_pool.ip_range('floating',
+                                           relative_start=-15,
+                                           relative_end=-2))]
+
+                if 'baremetal' in networks and \
+                        default_node_group.get_network_pools(name='ironic'):
+                    ironic_net_pool = default_node_group.get_network_pool(
+                        name='ironic')
+                    networks['baremetal']['cidr'] = ironic_net_pool.net
+                    net_settings[net_provider]['config'][
+                        'baremetal_gateway'] = ironic_net_pool.gateway
+                    networks['baremetal']['ip_range'] = \
+                        list(ironic_net_pool.ip_range())
+                    net_settings[net_provider]['config']['baremetal_range'] = \
+                        list(ironic_net_pool.ip_range('baremetal'))
+
+                for pool in default_node_group.get_network_pools(
+                        name__in=['storage', 'management']):
+                    networks[pool.name]['cidr'] = str(pool.net)
+                    networks[pool.name]['ip_range'] = self.get_range(
+                        pool.net)[0]
+                    networks[pool.name]['notation'] = 'ip_ranges'
+                    networks[pool.name]['vlan_start'] = pool.vlan_start
+
+                if net_provider == 'neutron':
+                    net_settings[net_provider]['config']['internal_cidr'] = \
+                        '192.168.0.0/24'
+                    net_settings[net_provider]['config']['internal_gateway'] =\
+                        '192.168.0.1'
+                    private_net_pool = default_node_group.get_network_pool(
+                        name='private')
+
+                    networks['private_tun']['cidr'] = \
+                        str(private_net_pool.net)
+                    networks['private_gre']['cidr'] = \
+                        str(private_net_pool.net)
+                    networks['private_tun']['vlan_start'] = \
+                        private_net_pool.vlan_start or None
+                    networks['private_gre']['vlan_start'] = \
+                        private_net_pool.vlan_start or None
+
+                    networks['private_vlan']['vlan_start'] = None
+                    net_settings[net_provider]['config']['vlan_range'] = \
+                        (private_net_pool.vlan_start or None,
+                         private_net_pool.vlan_end or None)
+
+                elif net_provider == 'nova_network':
+                    private_net_pool = default_node_group.get_network_pool(
+                        name='private')
+                    net_settings[net_provider]['config'][
+                        'fixed_networks_cidr'] = \
+                        str(private_net_pool.net) or None
+                    net_settings[net_provider]['config'][
+                        'fixed_networks_vlan_start'] = \
+                        private_net_pool.vlan_start or None
+
+            self.client.put_release_default_net_settings(
+                _release['id'], net_settings)
+
+    def get_node_group_and_role(self, node_name, nodes_dict):
+        devops_node = self.environment.d_env.get_node(name=node_name)
+        node_group = devops_node.group.name
+        if isinstance(nodes_dict[node_name][0], list):
+            # Backwards compatibility
+            node_roles = nodes_dict[node_name][0]
+        else:
+            node_roles = nodes_dict[node_name]
+        return node_group, node_roles
+
+    @logwrap
+    def update_nodes_interfaces(self, cluster_id, nailgun_nodes=None):
+        nailgun_nodes = nailgun_nodes or []
+        if not nailgun_nodes:
+            nailgun_nodes = self.client.list_cluster_nodes(cluster_id)
+        for node in nailgun_nodes:
+            assigned_networks = {}
+            interfaces = self.client.get_node_interfaces(node['id'])
+            interfaces = {iface['mac']: iface for iface in interfaces}
+            d_node = self.get_devops_node_by_nailgun_node(node)
+            for net in d_node.network_configs:
+                if net.aggregation is None:  # Have some ifaces aggregation?
+                    node_iface = d_node.interface_set.get(label=net.label)
+                    assigned_networks[interfaces[
+                        node_iface.mac_address]['name']] = net.networks
+                else:
+                    assigned_networks[net.label] = net.networks
+
+            self.update_node_networks(node['id'], assigned_networks)
+
+    @logwrap
+    def update_node_networks(self, node_id, interfaces_dict,
+                             raw_data=None,
+                             override_ifaces_params=None):
+        interfaces = self.client.get_node_interfaces(node_id)
+
+        node = [n for n in self.client.list_nodes() if n['id'] == node_id][0]
+        d_node = self.get_devops_node_by_nailgun_node(node)
+        if d_node:
+            bonds = [n for n in d_node.network_configs
+                     if n.aggregation is not None]
+            for bond in bonds:
+                macs = [i.mac_address.lower() for i in
+                        d_node.interface_set.filter(label__in=bond.parents)]
+                parents = [{'name': iface['name']} for iface in interfaces
+                           if iface['mac'].lower() in macs]
+                bond_config = {
+                    'mac': None,
+                    'mode': bond.aggregation,
+                    'name': bond.label,
+                    'slaves': parents,
+                    'state': None,
+                    'type': 'bond',
+                    'assigned_networks': []
+                }
+                interfaces.append(bond_config)
+
+        if raw_data is not None:
+            interfaces.extend(raw_data)
+
+        def get_iface_by_name(ifaces, name):
+            iface = [_iface for _iface in ifaces if _iface['name'] == name]
+            assert_true(len(iface) > 0,
+                        "Interface with name {} is not present on "
+                        "node. Please check override params.".format(name))
+            return iface[0]
+
+        if override_ifaces_params is not None:
+            for interface in override_ifaces_params:
+                get_iface_by_name(interfaces, interface['name']).\
+                    update(interface)
+
+        all_networks = dict()
+        for interface in interfaces:
+            all_networks.update(
+                {net['name']: net for net in interface['assigned_networks']})
+
+        for interface in interfaces:
+            name = interface["name"]
+            interface['assigned_networks'] = \
+                [all_networks[i] for i in interfaces_dict.get(name, []) if
+                 i in all_networks.keys()]
+
+        self.client.put_node_interfaces(
+            [{'id': node_id, 'interfaces': interfaces}])
+
+    def update_nodegroup_net_settings(self, network_configuration, nodegroup,
+                                      cluster_id=None):
+        # seg_type = network_configuration.get('networking_parameters', {}) \
+        #    .get('segmentation_type')
+        nodegroup_id = self.get_nodegroup(cluster_id, nodegroup['name'])['id']
+        for net in network_configuration.get('networks'):
+            if nodegroup['name'] == 'default' and \
+                    net['name'] == 'fuelweb_admin':
+                continue
+
+            if net['group_id'] == nodegroup_id:
+                group = self.environment.d_env.get_group(
+                    name=nodegroup['name'])
+                net_pool = group.networkpool_set.get(name=net['name'])
+                net['cidr'] = net_pool.net
+                # if net['meta']['use_gateway']:
+                #     net['gateway'] = net_pool.gateway
+                # else:
+                #     net['gateway'] = None
+                net['gateway'] = net_pool.gateway
+                if net['gateway']:
+                    net['meta']['use_gateway'] = True
+                    net['meta']['gateway'] = net['gateway']
+                else:
+                    net['meta']['use_gateway'] = False
+
+                if not net['meta'].get('neutron_vlan_range', False):
+                    net['vlan_start'] = net_pool.vlan_start
+                net['meta']['notation'] = 'ip_ranges'
+                net['ip_ranges'] = [list(net_pool.ip_range())]
+
+        return network_configuration
+
+    @logwrap
+    def get_network_pool(self, pool_name, group_name='default'):
+        group = self.environment.d_env.get_group(name=group_name)
+        net_pool = group.get_network_pool(name=pool_name)
+        _net_pool = {
+            "gateway": net_pool.gateway,
+            "network": net_pool.ip_range
+        }
+        return _net_pool
+
+
+# TODO(ddmitriev): this code will be removed after moving to fuel-devops3.0
+# pylint: disable=no-member
+# noinspection PyUnresolvedReferences
+if (distutils.version.LooseVersion(devops.__version__) <
+        distutils.version.LooseVersion('3')):
+    logger.info("Use FuelWebClient compatible to fuel-devops 2.9")
+    FuelWebClient = FuelWebClient29
+else:
+    logger.info("Use FuelWebClient compatible to fuel-devops 3.0")
+    FuelWebClient = FuelWebClient30
+# pylint: enable=no-member

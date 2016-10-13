@@ -15,10 +15,8 @@
 import os
 import re
 import sys
-import yaml
+import traceback
 import zlib
-from urllib2 import urlopen
-from urlparse import urlparse
 from xml.dom.minidom import parseString
 
 from proboscis import register
@@ -27,10 +25,17 @@ from proboscis.asserts import assert_equal
 from proboscis.asserts import assert_is_not_none
 from proboscis.asserts import assert_not_equal
 from proboscis.asserts import assert_true
+# pylint: disable=import-error,wrong-import-order
+# noinspection PyUnresolvedReferences
+from six.moves.urllib.request import urlopen
+# noinspection PyUnresolvedReferences
+from six.moves.urllib.parse import urlparse
+# pylint: enable=import-error,wrong-import-order
+import yaml
 
 from fuelweb_test import logger
 from fuelweb_test import settings
-
+from fuelweb_test.helpers.ssh_manager import SSHManager
 
 patching_validation_schema = {
     'type': {
@@ -208,10 +213,10 @@ def get_package_test_info(package, pkg_type, tests_path, patch_target):
     target, project = _get_target_and_project(package, all_packages)
     if patch_target == 'master':
         if target not in ['master', 'bootstrap']:
-            return set([None])
+            return {None}
     if patch_target == 'environment':
         if target not in ['deployment', 'provisioning']:
-            return set([None])
+            return {None}
     target_tests_path = "/".join((tests_path, pkg_type, target, tests_file))
     project_tests_path = "/".join((tests_path, pkg_type, target, project,
                                    tests_file))
@@ -222,8 +227,9 @@ def get_package_test_info(package, pkg_type, tests_path, patch_target):
             test = yaml.load(open(path).read())
             if 'system_tests' in test.keys():
                 tests.update(test['system_tests']['tags'])
-        except IOError:
-            pass
+        except IOError as e:
+            logger.warning('Ignoring exception: {!r}'.format(e))
+            logger.debug(traceback.format_exc())
     return tests
 
 
@@ -269,10 +275,11 @@ def add_remote_repositories(environment, mirrors, prefix_name='custom_repo'):
         name = '{0}_{1}'.format(prefix_name, mirrors.index(mir))
         local_repo_path = '/'.join([settings.PATCHING_WEB_DIR, name])
         remote_repo_url = mir
-        mirror_remote_repository(
-            admin_remote=environment.d_env.get_admin_remote(),
-            remote_repo_url=remote_repo_url,
-            local_repo_path=local_repo_path)
+        with environment.d_env.get_admin_remote() as remote:
+            mirror_remote_repository(
+                admin_remote=remote,
+                remote_repo_url=remote_repo_url,
+                local_repo_path=local_repo_path)
         repositories.add(name)
     return repositories
 
@@ -303,9 +310,11 @@ def connect_slaves_to_repo(environment, nodes, repo_name):
         ]
 
     for slave in nodes:
-        remote = environment.d_env.get_ssh_to_remote(slave['ip'])
         for cmd in cmds:
-            environment.execute_remote_cmd(remote, cmd, exit_code=0)
+            SSHManager().execute_on_remote(
+                ip=slave['ip'],
+                cmd=cmd
+            )
 
 
 def connect_admin_to_repo(environment, repo_name):
@@ -327,9 +336,11 @@ def connect_admin_to_repo(environment, repo_name):
         "yum check-update; [[ $? -eq 100 || $? -eq 0 ]]"
     ]
 
-    remote = environment.d_env.get_admin_remote()
     for cmd in cmds:
-        environment.execute_remote_cmd(remote, cmd, exit_code=0)
+        SSHManager().execute_on_remote(
+            ip=SSHManager().admin_ip,
+            cmd=cmd
+        )
 
 
 def update_packages(environment, remote, packages, exclude_packages=None):
@@ -349,7 +360,7 @@ def update_packages(environment, remote, packages, exclude_packages=None):
                 ' '.join(packages), ','.join(exclude_packages or []))
         ]
     for cmd in cmds:
-        environment.execute_remote_cmd(remote, cmd, exit_code=0)
+        remote.check_call(cmd)
 
 
 def update_packages_on_slaves(environment, slaves, packages=None,
@@ -358,8 +369,8 @@ def update_packages_on_slaves(environment, slaves, packages=None,
         # Install all updates
         packages = ' '
     for slave in slaves:
-        remote = environment.d_env.get_ssh_to_remote(slave['ip'])
-        update_packages(environment, remote, packages, exclude_packages)
+        with environment.d_env.get_ssh_to_remote(slave['ip']) as remote:
+            update_packages(environment, remote, packages, exclude_packages)
 
 
 def get_slaves_ips_by_role(slaves, role=None):
@@ -385,7 +396,7 @@ def get_slaves_ids_by_role(slaves, role=None):
 
 def verify_fix_apply_step(apply_step):
     validation_schema = patching_validation_schema
-    for key in validation_schema.keys():
+    for key in validation_schema:
         if key in apply_step.keys():
             is_exists = apply_step[key] is not None
         else:
@@ -411,19 +422,20 @@ def verify_fix_apply_step(apply_step):
                                       value=apply_step[key],
                                       valid=validation_schema[key]['values']))
         if 'data_type' in validation_schema[key].keys():
-            assert_true(type(apply_step[key]) is
-                        validation_schema[key]['data_type'],
-                        "Unexpected data type in patch apply scenario step:  '"
-                        "{key}' is '{type}', but expecting '{expect}'.".format(
-                            key=key,
-                            type=type(apply_step[key]),
-                            expect=validation_schema[key]['data_type']))
+            assert_true(
+                isinstance(
+                    apply_step[key], validation_schema[key]['data_type']),
+                "Unexpected data type in patch apply scenario step:  '"
+                "{key}' is '{type}', but expecting '{expect}'.".format(
+                    key=key,
+                    type=type(apply_step[key]),
+                    expect=validation_schema[key]['data_type']))
 
 
 def validate_fix_apply_step(apply_step, environment, slaves):
     verify_fix_apply_step(apply_step)
     slaves = [] if not slaves else slaves
-    command = ''
+    command = '',
     remotes_ips = set()
     devops_action = ''
     devops_nodes = set()
@@ -464,9 +476,10 @@ def validate_fix_apply_step(apply_step, environment, slaves):
                     "service isn't specified".format(apply_step['id'],
                                                      apply_step['type']))
         action = apply_step['type'].split('service_')[1]
-        command = ("find /etc/init.d/ -regex '/etc/init.d/{service}' -printf "
-                   "'%f\n' -quit | xargs -i service {{}} {action}").format(
-            service=apply_step['service'], action=action)
+        command = (
+            "find /etc/init.d/ -regex '/etc/init.d/{service}' -printf "
+            "'%f\n' -quit | xargs -i service {{}} {action}".format(
+                service=apply_step['service'], action=action), )
     elif apply_step['type'] in ('server_down', 'server_up', 'server_reboot'):
         assert_true('master' not in apply_step['target'],
                     'Action type "{0}" doesn\'t accept "master" node as '
@@ -490,18 +503,19 @@ def validate_fix_apply_step(apply_step, environment, slaves):
                                                     apply_step['type']))
         tasks_timeout = apply_step['tasks_timeout'] if 'tasks_timeout' in \
             apply_step.keys() else 60 * 30
-        command = [
+        command = (
             'RUN_TASKS',
             nodes_ids,
             apply_step['tasks'],
             tasks_timeout
-        ]
+        )
     else:
         assert_true(len(apply_step['command'] or '') > 0,
                     "Step #{0} in apply patch scenario perform '{1}', but "
                     "command isn't specified".format(apply_step['id'],
                                                      apply_step['type']))
         command = apply_step['command']
+    # remotes sessions .clear() placed in run_actions()
     remotes = [environment.d_env.get_ssh_to_remote(ip) for ip in remotes_ips] \
         if command else []
     devops_nodes = devops_nodes if devops_action else []
@@ -511,7 +525,7 @@ def validate_fix_apply_step(apply_step, environment, slaves):
 def get_errata(path, bug_id):
     scenario_path = '{0}/bugs/{1}/erratum.yaml'.format(path, bug_id)
     assert_true(os.path.exists(scenario_path),
-                "Erratum for bug #{0} is not found in '{0}' "
+                "Erratum for bug #{0} is not found in '{1}' "
                 "directory".format(bug_id, settings.PATCHING_APPLY_TESTS))
     with open(scenario_path) as f:
         return yaml.load(f.read())
@@ -577,13 +591,17 @@ def run_actions(environment, target, slaves, action_type='patch-scenario'):
                                                        tasks, timeout)
             continue
         for remote in remotes:
-            environment.execute_remote_cmd(remote, command)
+            remote.check_call(command)
         if devops_action == 'down':
             environment.fuel_web.warm_shutdown_nodes(devops_nodes)
         elif devops_action == 'up':
             environment.fuel_web.warm_start_nodes(devops_nodes)
         elif devops_action == 'reboot':
             environment.fuel_web.warm_restart_nodes(devops_nodes)
+
+        # clear connections
+        for remote in remotes:
+            remote.clear()
 
 
 def apply_patches(environment, target, slaves=None):

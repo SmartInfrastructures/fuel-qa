@@ -11,96 +11,41 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+from warnings import warn
 
 from proboscis.asserts import assert_equal
 from proboscis import test
+from proboscis import SkipTest
 
-from fuelweb_test.helpers import checkers
-from fuelweb_test.helpers import os_actions
+from fuelweb_test.helpers.common import Common
 from fuelweb_test.helpers.decorators import log_snapshot_after_test
+from fuelweb_test.helpers import os_actions
+from fuelweb_test import logger
 from fuelweb_test.settings import DEPLOYMENT_MODE
+from fuelweb_test.settings import NEUTRON_SEGMENT
 from fuelweb_test.tests.base_test_case import SetupEnvironment
 from fuelweb_test.tests.base_test_case import TestBasic
-from fuelweb_test import logger
 
 
-@test(groups=["thread_1", "neutron", "smoke_neutron", "deployment"])
-class NeutronGre(TestBasic):
-    """NeutronGre."""  # TODO documentation
-
-    @test(depends_on=[SetupEnvironment.prepare_slaves_3],
-          groups=["deploy_neutron_gre", "ha_one_controller_neutron_gre",
-                  "cinder", "swift", "glance", "neutron", "deployment"])
-    @log_snapshot_after_test
-    def deploy_neutron_gre(self):
-        """Deploy cluster in ha mode with 1 controller and Neutron GRE
-
-        Scenario:
-            1. Create cluster
-            2. Add 1 node with controller role
-            3. Add 2 nodes with compute role
-            4. Deploy the cluster
-            5. Run network verification
-            6. Run OSTF
-
-        Duration 35m
-        Snapshot deploy_neutron_gre
-
-        """
-        self.env.revert_snapshot("ready_with_3_slaves")
-
-        segment_type = 'gre'
-        data = {
-            "net_provider": 'neutron',
-            "net_segment_type": segment_type,
-            'tenant': 'simpleGre',
-            'user': 'simpleGre',
-            'password': 'simpleGre'
-        }
-        cluster_id = self.fuel_web.create_cluster(
-            name=self.__class__.__name__,
-            mode=DEPLOYMENT_MODE,
-            settings=data
-        )
-        self.fuel_web.update_nodes(
-            cluster_id,
-            {
-                'slave-01': ['controller'],
-                'slave-02': ['compute', 'cinder'],
-                'slave-03': ['compute', 'cinder']
-            }
-        )
-        self.fuel_web.update_internal_network(cluster_id, '192.168.196.0/26',
-                                              '192.168.196.1')
-        self.fuel_web.deploy_cluster_wait(cluster_id)
-        os_conn = os_actions.OpenStackActions(
-            self.fuel_web.get_public_vip(cluster_id),
-            data['user'], data['password'], data['tenant'])
-
-        cluster = self.fuel_web.client.get_cluster(cluster_id)
-        assert_equal(str(cluster['net_provider']), 'neutron')
-        # assert_equal(str(cluster['net_segment_type']), segment_type)
-        self.fuel_web.check_fixed_network_cidr(
-            cluster_id, os_conn)
-
-        self.fuel_web.verify_network(cluster_id)
-
-        self.fuel_web.run_ostf(
-            cluster_id=cluster_id)
-
-        self.env.make_snapshot("deploy_neutron_gre")
-
-
-@test(groups=["thread_1", "neutron"])
+@test(enabled=False, groups=["thread_1", "neutron"])
 class NeutronVlan(TestBasic):
-    """NeutronVlan."""  # TODO documentation
+    """NeutronVlan.
 
-    @test(depends_on=[SetupEnvironment.prepare_slaves_3],
+    Test disabled and move to fuel_tests suite:
+        fuel_tests.test.test_neutron
+
+    """  # TODO documentation
+
+    @test(enabled=False,
+          depends_on=[SetupEnvironment.prepare_slaves_3],
           groups=["deploy_neutron_vlan", "ha_one_controller_neutron_vlan",
                   "deployment", "nova", "nova-compute"])
     @log_snapshot_after_test
     def deploy_neutron_vlan(self):
         """Deploy cluster in ha mode with 1 controller and Neutron VLAN
+
+        Test disabled and move to fuel_tests suite:
+            fuel_tests.test.test_neutron.TestNeutronVlan
 
         Scenario:
             1. Create cluster
@@ -114,15 +59,18 @@ class NeutronVlan(TestBasic):
         Snapshot deploy_neutron_vlan
 
         """
+        # pylint: disable=W0101
+        warn("Test disabled and move to fuel_tests suite", DeprecationWarning)
+        raise SkipTest("Test disabled and move to fuel_tests suite")
+
         self.env.revert_snapshot("ready_with_3_slaves")
 
-        segment_type = 'vlan'
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
             mode=DEPLOYMENT_MODE,
             settings={
                 "net_provider": 'neutron',
-                "net_segment_type": segment_type,
+                "net_segment_type": NEUTRON_SEGMENT['vlan'],
                 'tenant': 'simpleVlan',
                 'user': 'simpleVlan',
                 'password': 'simpleVlan'
@@ -140,25 +88,34 @@ class NeutronVlan(TestBasic):
 
         cluster = self.fuel_web.client.get_cluster(cluster_id)
         assert_equal(str(cluster['net_provider']), 'neutron')
-        # assert_equal(str(cluster['net_segment_type']), segment_type)
 
         self.fuel_web.verify_network(cluster_id)
 
         self.fuel_web.run_ostf(
             cluster_id=cluster_id)
 
-        self.env.make_snapshot("deploy_neutron_vlan")
+        self.env.make_snapshot("deploy_neutron_vlan", is_make=True)
 
 
-@test(groups=["neutron", "ha", "ha_neutron", "classic_provisioning"])
+@test(enabled=False,
+      groups=["neutron", "ha", "ha_neutron", "classic_provisioning"])
 class NeutronGreHa(TestBasic):
-    """NeutronGreHa."""  # TODO documentation
+    """NeutronGreHa.
 
-    @test(depends_on=[SetupEnvironment.prepare_slaves_5],
+    Test disabled and move to fuel_tests suite:
+        fuel_tests.test.test_neutron
+
+    """  # TODO documentation
+
+    @test(enabled=False,
+          depends_on=[SetupEnvironment.prepare_slaves_5],
           groups=["deploy_neutron_gre_ha", "ha_neutron_gre"])
     @log_snapshot_after_test
     def deploy_neutron_gre_ha(self):
-        """Deploy cluster in HA mode with Neutron GRE
+        """Deploy cluster in HA mode with Neutron GRE (DEPRECATED)
+
+        Test disabled and move to fuel_tests suite:
+            fuel_tests.test.test_neutron.TestNeutronTunHa
 
         Scenario:
             1. Create cluster
@@ -166,21 +123,25 @@ class NeutronGreHa(TestBasic):
             3. Add 2 nodes with compute role
             4. Deploy the cluster
             5. Run network verification
-            6. Run OSTF
+            6. Check Swift ring and rebalance it if needed
+            7. Run OSTF
 
         Duration 80m
         Snapshot deploy_neutron_gre_ha
 
         """
+        # pylint: disable=W0101
+        warn("Test disabled and move to fuel_tests suite", DeprecationWarning)
+        raise SkipTest("Test disabled and move to fuel_tests suite")
+
         self.env.revert_snapshot("ready_with_5_slaves")
 
-        segment_type = 'gre'
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
             mode=DEPLOYMENT_MODE,
             settings={
                 "net_provider": 'neutron',
-                "net_segment_type": segment_type,
+                "net_segment_type": NEUTRON_SEGMENT['gre'],
                 'tenant': 'haGre',
                 'user': 'haGre',
                 'password': 'haGre'
@@ -205,18 +166,8 @@ class NeutronGreHa(TestBasic):
         devops_node = self.fuel_web.get_nailgun_primary_node(
             self.env.d_env.nodes().slaves[0])
         logger.debug("devops node name is {0}".format(devops_node.name))
-        _ip = self.fuel_web.get_nailgun_node_by_name(devops_node.name)['ip']
-        remote = self.env.d_env.get_ssh_to_remote(_ip)
-        for i in range(5):
-            try:
-                checkers.check_swift_ring(remote)
-                break
-            except AssertionError:
-                result = remote.execute(
-                    "/usr/local/bin/swift-rings-rebalance.sh")
-                logger.debug("command execution result is {0}".format(result))
-        else:
-            checkers.check_swift_ring(remote)
+        ip = self.fuel_web.get_nailgun_node_by_name(devops_node.name)['ip']
+        Common.rebalance_swift_ring(ip)
 
         self.fuel_web.run_ostf(
             cluster_id=cluster_id,
@@ -225,81 +176,24 @@ class NeutronGreHa(TestBasic):
         self.env.make_snapshot("deploy_neutron_gre_ha")
 
 
-@test(groups=["thread_6", "neutron", "ha", "ha_neutron"])
-class NeutronGreHaPublicNetwork(TestBasic):
-    """NeutronGreHaPublicNetwork."""  # TODO documentation
-
-    @test(depends_on=[SetupEnvironment.prepare_slaves_5],
-          groups=["deploy_neutron_gre_ha_public_network"])
-    @log_snapshot_after_test
-    def deploy_neutron_gre_ha_with_public_network(self):
-        """Deploy cluster in HA mode with Neutron GRE and public network
-           assigned to all nodes
-
-        Scenario:
-            1. Create cluster
-            2. Add 3 nodes with controller role
-            3. Add 2 nodes with compute role
-            4. Enable assign public networks to all nodes option
-            5. Deploy the cluster
-            6. Check that public network was assigned to all nodes
-            7. Run network verification
-            8. Run OSTF
-
-        Duration 80m
-        Snapshot deploy_neutron_gre_ha_public_network
-
-        """
-        self.env.revert_snapshot("ready_with_5_slaves")
-
-        segment_type = 'gre'
-        cluster_id = self.fuel_web.create_cluster(
-            name=self.__class__.__name__,
-            mode=DEPLOYMENT_MODE,
-            settings={
-                "net_provider": 'neutron',
-                "net_segment_type": segment_type,
-                'tenant': 'haGre',
-                'user': 'haGre',
-                'password': 'haGre',
-                'assign_to_all_nodes': True
-            }
-        )
-        self.fuel_web.update_nodes(
-            cluster_id,
-            {
-                'slave-01': ['controller'],
-                'slave-02': ['controller'],
-                'slave-03': ['controller'],
-                'slave-04': ['compute'],
-                'slave-05': ['compute']
-            }
-        )
-        self.fuel_web.deploy_cluster_wait(cluster_id)
-
-        cluster = self.fuel_web.client.get_cluster(cluster_id)
-        assert_equal(str(cluster['net_provider']), 'neutron')
-
-        self.fuel_web.verify_network(cluster_id)
-
-        self.fuel_web.security.verify_firewall(cluster_id)
-
-        self.fuel_web.run_ostf(
-            cluster_id=cluster_id,
-            test_sets=['ha', 'smoke', 'sanity'])
-
-        self.env.make_snapshot("deploy_neutron_gre_ha_public_network")
-
-
-@test(groups=["neutron", "ha", "ha_neutron"])
+@test(enabled=False, groups=["neutron", "ha", "ha_neutron"])
 class NeutronVlanHa(TestBasic):
-    """NeutronVlanHa."""  # TODO documentation
+    """NeutronVlanHa.
 
-    @test(depends_on=[SetupEnvironment.prepare_slaves_5],
-          groups=["deploy_neutron_vlan_ha", "ha_neutron_vlan"])
+    Test disabled and move to fuel_tests suite:
+        fuel_tests.test.test_neutron
+
+    """  # TODO documentation
+
+    @test(enabled=False,
+          depends_on=[SetupEnvironment.prepare_slaves_5],
+          groups=["deploy_neutron_vlan_ha", "neutron_vlan_ha"])
     @log_snapshot_after_test
     def deploy_neutron_vlan_ha(self):
         """Deploy cluster in HA mode with Neutron VLAN
+
+        Test disabled and move to fuel_tests suite:
+            fuel_tests.test.test_neutron.TestNeutronVlanHa
 
         Scenario:
             1. Create cluster
@@ -307,21 +201,25 @@ class NeutronVlanHa(TestBasic):
             3. Add 2 nodes with compute role
             4. Deploy the cluster
             5. Run network verification
-            6. Run OSTF
+            6. Check Swift ring and rebalance it if needed
+            7. Run OSTF
 
         Duration 80m
         Snapshot deploy_neutron_vlan_ha
 
         """
+        # pylint: disable=W0101
+        warn("Test disabled and move to fuel_tests suite", DeprecationWarning)
+        raise SkipTest("Test disabled and move to fuel_tests suite")
+
         self.env.revert_snapshot("ready_with_5_slaves")
 
-        segment_type = 'vlan'
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
             mode=DEPLOYMENT_MODE,
             settings={
                 "net_provider": 'neutron',
-                "net_segment_type": segment_type
+                "net_segment_type": NEUTRON_SEGMENT['vlan']
             }
         )
         self.fuel_web.update_nodes(
@@ -342,7 +240,6 @@ class NeutronVlanHa(TestBasic):
         assert_equal(str(cluster['net_provider']), 'neutron')
         os_conn = os_actions.OpenStackActions(
             self.fuel_web.get_public_vip(cluster_id))
-        # assert_equal(str(cluster['net_segment_type']), segment_type)
         self.fuel_web.check_fixed_network_cidr(
             cluster_id, os_conn)
 
@@ -350,89 +247,10 @@ class NeutronVlanHa(TestBasic):
         devops_node = self.fuel_web.get_nailgun_primary_node(
             self.env.d_env.nodes().slaves[0])
         logger.debug("devops node name is {0}".format(devops_node.name))
-        _ip = self.fuel_web.get_nailgun_node_by_name(devops_node.name)['ip']
-        remote = self.env.d_env.get_ssh_to_remote(_ip)
-        for i in range(5):
-            try:
-                checkers.check_swift_ring(remote)
-                break
-            except AssertionError:
-                result = remote.execute(
-                    "/usr/local/bin/swift-rings-rebalance.sh")
-                logger.debug("command execution result is {0}".format(result))
-        else:
-            checkers.check_swift_ring(remote)
+        ip = self.fuel_web.get_nailgun_node_by_name(devops_node.name)['ip']
+        Common.rebalance_swift_ring(ip)
 
         self.fuel_web.run_ostf(
             cluster_id=cluster_id, test_sets=['ha', 'smoke', 'sanity'])
 
         self.env.make_snapshot("deploy_neutron_vlan_ha")
-
-
-@test(groups=["thread_6", "neutron", "ha", "ha_neutron"])
-class NeutronVlanHaPublicNetwork(TestBasic):
-    """NeutronVlanHaPublicNetwork."""  # TODO documentation
-
-    @test(depends_on=[SetupEnvironment.prepare_slaves_5],
-          groups=["deploy_neutron_vlan_ha_public_network"])
-    @log_snapshot_after_test
-    def deploy_neutron_vlan_ha_with_public_network(self):
-        """Deploy cluster in HA mode with Neutron VLAN and public network
-           assigned to all nodes
-
-        Scenario:
-            1. Create cluster
-            2. Add 3 nodes with controller role
-            3. Add 2 nodes with compute role
-            4. Enable assign public networks to all nodes option
-            5. Deploy the cluster
-            6. Check that public network was assigned to all nodes
-            7. Run network verification
-            8. Run OSTF
-
-        Duration 80m
-        Snapshot deploy_neutron_vlan_ha_public_network
-
-        """
-        self.env.revert_snapshot("ready_with_5_slaves")
-
-        segment_type = 'vlan'
-        cluster_id = self.fuel_web.create_cluster(
-            name=self.__class__.__name__,
-            mode=DEPLOYMENT_MODE,
-            settings={
-                "net_provider": 'neutron',
-                "net_segment_type": segment_type,
-                'assign_to_all_nodes': True
-            }
-        )
-        self.fuel_web.update_nodes(
-            cluster_id,
-            {
-                'slave-01': ['controller'],
-                'slave-02': ['controller'],
-                'slave-03': ['controller'],
-                'slave-04': ['compute'],
-                'slave-05': ['compute']
-            }
-        )
-        self.fuel_web.update_internal_network(cluster_id, '192.168.196.0/22',
-                                              '192.168.196.1')
-        self.fuel_web.deploy_cluster_wait(cluster_id)
-
-        cluster = self.fuel_web.client.get_cluster(cluster_id)
-        assert_equal(str(cluster['net_provider']), 'neutron')
-        # assert_equal(str(cluster['net_segment_type']), segment_type)
-        os_conn = os_actions.OpenStackActions(
-            self.fuel_web.get_public_vip(cluster_id))
-        self.fuel_web.check_fixed_network_cidr(
-            cluster_id, os_conn)
-
-        self.fuel_web.verify_network(cluster_id)
-
-        self.fuel_web.security.verify_firewall(cluster_id)
-
-        self.fuel_web.run_ostf(
-            cluster_id=cluster_id, test_sets=['ha', 'smoke', 'sanity'])
-
-        self.env.make_snapshot("deploy_neutron_vlan_ha_public_network")

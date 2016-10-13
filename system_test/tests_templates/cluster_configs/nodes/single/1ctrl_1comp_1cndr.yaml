@@ -1,0 +1,11 @@
+---
+- roles:
+   - controller
+  count: 1
+- roles:
+   - compute
+  count: 1
+- roles:
+   - cinder
+  count: 1
+

@@ -14,13 +14,15 @@
 
 import os
 import time
-import urllib2
 
 from proboscis import test
 from proboscis.asserts import assert_is_not_none
 from proboscis.asserts import assert_true
+# pylint: disable=import-error
+# noinspection PyUnresolvedReferences
+from six.moves.urllib.request import urlopen
+# pylint: enable=import-error
 
-from devops.error import TimeoutError
 from devops.helpers.helpers import wait
 from fuelweb_test import logger
 from fuelweb_test import settings
@@ -130,15 +132,15 @@ class PatchingTests(TestBasic):
         for repo in patching_repos:
             patching.connect_slaves_to_repo(self.env, slaves, repo)
         if settings.PATCHING_MASTER_MIRRORS:
-            for repo in patching_master_repos:
-                remote = self.env.d_env.get_admin_remote()
-                install_pkg(remote, 'yum-utils')
-                patching.connect_admin_to_repo(self.env, repo)
+            with self.env.d_env.get_admin_remote() as remote:
+                for repo in patching_master_repos:
+                    install_pkg(remote, 'yum-utils')
+                    patching.connect_admin_to_repo(self.env, repo)
 
         # Step #5
         if settings.LATE_ARTIFACTS_JOB_URL:
-            data = urllib2.urlopen(settings.LATE_ARTIFACTS_JOB_URL +
-                                   "/artifact/artifacts/artifacts.txt")
+            data = urlopen(settings.LATE_ARTIFACTS_JOB_URL +
+                           "/artifact/artifacts/artifacts.txt")
             for package in data:
                 os.system("wget --directory-prefix"
                           " {0} {1}".format(settings.UPDATE_FUEL_PATH,
@@ -186,6 +188,53 @@ class PatchingTests(TestBasic):
             assert_true(rally_benchmarks_passed,
                         "Rally benchmarks show performance degradation "
                         "after packages patching.")
+
+        number_of_nodes = len(self.fuel_web.client.list_cluster_nodes(
+            cluster_id))
+
+        cluster_nodes = self.fuel_web.client.list_cluster_nodes(cluster_id)
+        roles_list = [node['roles'] for node in cluster_nodes]
+        unique_roles = []
+
+        for role in roles_list:
+            if not [unique_role for unique_role in unique_roles
+                    if set(role) == set(unique_role)]:
+                unique_roles.append(role)
+
+        self.env.bootstrap_nodes(self.env.d_env.nodes().slaves[
+                                 number_of_nodes:number_of_nodes + 1])
+
+        for roles in unique_roles:
+            if "mongo" in roles:
+                continue
+
+            node = {'slave-0{}'.format(number_of_nodes + 1):
+                    [role for role in roles]}
+            logger.debug("Adding new node to the cluster: {0}".format(node))
+            self.fuel_web.update_nodes(
+                cluster_id, node)
+            self.fuel_web.deploy_cluster_wait(cluster_id,
+                                              check_services=False)
+            self.fuel_web.verify_network(cluster_id)
+            self.fuel_web.run_ostf(cluster_id=cluster_id,
+                                   test_sets=['sanity', 'smoke', 'ha'])
+
+            if "ceph-osd" in roles:
+                with self.fuel_web.get_ssh_for_node(
+                        'slave-0{}'.format(number_of_nodes + 1)
+                ) as remote_ceph:
+                    self.fuel_web.prepare_ceph_to_delete(remote_ceph)
+
+            nailgun_node = self.fuel_web.update_nodes(
+                cluster_id, node, False, True)
+            nodes = [_node for _node in nailgun_node
+                     if _node["pending_deletion"] is True]
+            self.fuel_web.deploy_cluster(cluster_id)
+            self.fuel_web.wait_node_is_discovered(nodes[0])
+
+            # sanity set isn't running due to LP1457515
+            self.fuel_web.run_ostf(cluster_id=cluster_id,
+                                   test_sets=['smoke', 'ha'])
 
 
 @test(groups=["patching_master_tests"])
@@ -254,8 +303,8 @@ class PatchingMasterTests(TestBasic):
                                         '" failed.'.format(self.snapshot_name))
 
         # Step #1
-        remote = self.env.d_env.get_admin_remote()
-        install_pkg(remote, 'yum-utils')
+        with self.env.d_env.get_admin_remote() as remote:
+            install_pkg(remote, 'yum-utils')
         patching_repos = patching.add_remote_repositories(
             self.env, settings.PATCHING_MASTER_MIRRORS)
 
@@ -264,8 +313,9 @@ class PatchingMasterTests(TestBasic):
 
         # Step #2
         if settings.LATE_ARTIFACTS_JOB_URL:
-            data = urllib2.urlopen(settings.LATE_ARTIFACTS_JOB_URL
-                                   + "/artifact/artifacts/artifacts.txt")
+            data = urlopen(
+                settings.LATE_ARTIFACTS_JOB_URL +
+                "/artifact/artifacts/artifacts.txt")
             for package in data:
                 os.system("wget --directory-prefix"
                           " {0} {1}".format(settings.UPDATE_FUEL_PATH,
@@ -299,37 +349,66 @@ class PatchingMasterTests(TestBasic):
             self.fuel_web.run_ostf(cluster_id=cluster_id)
             if number_of_nodes > 1:
                 self.fuel_web.verify_network(cluster_id)
-            self.env.bootstrap_nodes(
-                self.env.d_env.nodes().
-                slaves[number_of_nodes:number_of_nodes + 1])
-            self.fuel_web.update_nodes(
-                cluster_id,
-                {'slave-0{}'.format(number_of_nodes + 1): ['compute']},
-                True, False)
-            self.fuel_web.deploy_cluster_wait(cluster_id)
-            nailgun_nodes = self.fuel_web.update_nodes(
-                cluster_id,
-                {'slave-0{}'.format(number_of_nodes + 1): ['compute']},
-                False, True)
-            nodes = filter(
-                lambda x: x["pending_deletion"] is True, nailgun_nodes)
-            self.fuel_web.deploy_cluster(cluster_id)
-            wait(
-                lambda: self.fuel_web.is_node_discovered(nodes[0]),
-                timeout=6 * 60)
+
+            cluster_nodes = self.fuel_web.client.list_cluster_nodes(cluster_id)
+            roles_list = [node['roles'] for node in cluster_nodes]
+            unique_roles = []
+
+            for role in roles_list:
+                if not [unique_role for unique_role in unique_roles
+                        if set(role) == set(unique_role)]:
+                    unique_roles.append(role)
+
+            self.env.bootstrap_nodes(self.env.d_env.nodes().slaves[
+                                     number_of_nodes:number_of_nodes + 1])
+
+            for roles in unique_roles:
+                if "mongo" in roles:
+                    continue
+                node = {'slave-0{}'.format(number_of_nodes + 1):
+                        [role for role in roles]}
+                logger.debug("Adding new node to"
+                             " the cluster: {0}".format(node))
+                self.fuel_web.update_nodes(
+                    cluster_id, node)
+                self.fuel_web.deploy_cluster_wait(cluster_id,
+                                                  check_services=False)
+                self.fuel_web.verify_network(cluster_id)
+
+                self.fuel_web.run_ostf(cluster_id=cluster_id,
+                                       test_sets=['sanity', 'smoke', 'ha'])
+
+                if "ceph-osd" in roles:
+                    with self.fuel_web.get_ssh_for_node(
+                            'slave-0{}'.format(number_of_nodes + 1)
+                    ) as remote:
+                        self.fuel_web.prepare_ceph_to_delete(remote)
+                nailgun_node = self.fuel_web.update_nodes(
+                    cluster_id, node, False, True)
+                nodes = [_node for _node in nailgun_node
+                         if _node["pending_deletion"] is True]
+                self.fuel_web.deploy_cluster(cluster_id)
+                self.fuel_web.wait_node_is_discovered(nodes[0])
+
+                # sanity set isn't running due to LP1457515
+                self.fuel_web.run_ostf(cluster_id=cluster_id,
+                                       test_sets=['smoke', 'ha'])
+
+            active_nodes = []
+            for node in self.env.d_env.nodes().slaves:
+                if node.driver.node_active(node):
+                    active_nodes.append(node)
+            logger.debug('active nodes are {}'.format(active_nodes))
 
             self.fuel_web.stop_reset_env_wait(cluster_id)
             self.fuel_web.wait_nodes_get_online_state(
                 active_nodes, timeout=10 * 60)
             self.fuel_web.client.delete_cluster(cluster_id)
-            try:
-                wait((lambda: len(
-                    self.fuel_web.client.list_nodes()) == number_of_nodes),
-                    timeout=5 * 60)
-            except TimeoutError:
-                assert_true(len(
-                    self.fuel_web.client.list_nodes()) == number_of_nodes,
-                    'Nodes are not discovered in timeout 5 *60')
+            wait((lambda: len(
+                self.fuel_web.client.list_nodes()) == number_of_nodes),
+                timeout=5 * 60,
+                timeout_msg='Timeout: Nodes are not discovered')
+
         self.env.bootstrap_nodes(self.env.d_env.nodes().slaves[:3])
 
     @test(groups=["patching_master"],
@@ -353,8 +432,6 @@ class PatchingMasterTests(TestBasic):
             name=self.__class__.__name__,
             mode=settings.DEPLOYMENT_MODE,
             settings={
-                "net_provider": 'neutron',
-                "net_segment_type": settings.NEUTRON_SEGMENT_TYPE,
                 'tenant': 'patchingMaster',
                 'user': 'patchingMaster',
                 'password': 'patchingMaster'

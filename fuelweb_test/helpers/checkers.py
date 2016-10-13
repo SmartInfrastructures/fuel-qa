@@ -11,49 +11,93 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+
+from __future__ import division
+
 import hashlib
 import json
 import os
 import re
-import traceback
+from time import sleep
 
-from ipaddr import IPAddress
-from ipaddr import IPNetwork
+from devops.error import TimeoutError
+from devops.helpers.helpers import wait_pass
+from devops.helpers.helpers import wait
+from netaddr import IPAddress
+from netaddr import IPNetwork
+from proboscis.asserts import assert_equal
+from proboscis.asserts import assert_true
+
+from keystoneauth1 import exceptions
+# pylint: disable=redefined-builtin
+# noinspection PyUnresolvedReferences
+from six.moves import xrange
+# pylint: enable=redefined-builtin
+import yaml
+
+from core.helpers.log_helpers import logwrap
 
 from fuelweb_test import logger
-from fuelweb_test import logwrap
+from fuelweb_test.helpers.ssh_manager import SSHManager
+from fuelweb_test.helpers.utils import get_mongo_partitions
 from fuelweb_test.settings import EXTERNAL_DNS
 from fuelweb_test.settings import EXTERNAL_NTP
 from fuelweb_test.settings import OPENSTACK_RELEASE
 from fuelweb_test.settings import OPENSTACK_RELEASE_UBUNTU
 from fuelweb_test.settings import POOLS
 from fuelweb_test.settings import PUBLIC_TEST_IP
-from proboscis.asserts import assert_equal
-from proboscis.asserts import assert_false
-from proboscis.asserts import assert_true
-from devops.error import TimeoutError
-from devops.helpers.helpers import wait
-from devops.helpers.helpers import _wait
 
-from time import sleep
+
+ssh_manager = SSHManager()
 
 
 @logwrap
-def check_cinder_status(remote):
+def validate_minimal_amount_nodes(
+        nodes, expected_amount,
+        state='discover', online=True):
+    """Validate amount of nodes in state
+
+    :type nodes: iterable
+    :type expected_amount: int
+    :type state: str
+    :type online: bool
+    :raises: Exception
+    """
+    fnodes = [
+        node for node in nodes
+        if node['online'] == online and node['status'] == state]
+    if len(fnodes) < expected_amount:
+        raise Exception(
+            'Nodes in state {state} (online: {online}): '
+            '{amount}, while expected: {expected}'.format(
+                state=state,
+                online=online,
+                amount=len(fnodes),
+                expected=expected_amount
+            )
+        )
+
+
+@logwrap
+def check_cinder_status(ip):
     """Parse output and return False if any enabled service is down.
     'cinder service-list' stdout example:
     | cinder-scheduler | node-1.test.domain.local | nova | enabled |   up  |
     | cinder-scheduler | node-2.test.domain.local | nova | enabled |  down |
     """
     cmd = '. openrc; cinder service-list'
-    result = remote.execute(cmd)
-    cinder_services = ''.join(result['stdout'])
+    result = ssh_manager.execute_on_remote(
+        ip=ip,
+        cmd=cmd,
+        raise_on_assert=False
+    )
+    cinder_services = result['stdout_str']
     logger.debug('>$ cinder service-list\n{}'.format(cinder_services))
     if result['exit_code'] == 0:
         return all(' up ' in x.split('enabled')[1]
                    for x in cinder_services.split('\n')
-                   if 'cinder' in x and 'enabled' in x
-                   and len(x.split('enabled')))
+                   if 'cinder' in x and 'enabled' in x and
+                   len(x.split('enabled')))
     return False
 
 
@@ -81,45 +125,19 @@ def check_image(image, md5, path):
 
 
 @logwrap
-def get_interface_description(ctrl_ssh, interface_short_name):
-    return ''.join(
-        ctrl_ssh.execute(
-            '/sbin/ip addr show dev %s' % interface_short_name
-        )['stdout']
-    )
-
-
-def verify_network_configuration(remote, node):
-    for interface in node['network_data']:
-        if interface.get('vlan') is None:
-            continue  # todo excess check fix interface json format
-        interface_name = "{}.{}@{}".format(
-            interface['dev'], interface['vlan'], interface['dev'])
-        interface_short_name = "{}.{}".format(
-            interface['dev'], interface['vlan'])
-        interface_description = get_interface_description(
-            remote, interface_short_name)
-        assert_true(interface_name in interface_description)
-        if interface.get('name') == 'floating':
-            continue
-        if interface.get('ip'):
-            assert_true(
-                "inet {}".format(interface.get('ip')) in
-                interface_description)
-        else:
-            assert_false("inet " in interface_description)
-        if interface.get('brd'):
-            assert_true(
-                "brd {}".format(interface['brd']) in interface_description)
-
-
-@logwrap
-def verify_service(remote, service_name, count=1):
-    ps_output = remote.execute('ps ax')['stdout']
-    api = filter(lambda x: service_name in x, ps_output)
+def verify_service(ip, service_name, count=1,
+                   ignore_count_of_proccesses=False):
+    ps_output = ssh_manager.execute_on_remote(
+        ip=ip,
+        cmd='ps ax'
+    )['stdout']
+    api = [ps for ps in ps_output if service_name in ps]
     logger.debug("{} \\n: {}".format(service_name, str(api)))
-    assert_equal(len(api), count,
-                 "{0} count not equal to {1}".format(service_name, count))
+    if not ignore_count_of_proccesses:
+        assert_equal(len(api), count,
+                     "{0} count not equal to {1}".format(service_name, count))
+    else:
+        assert_true(len(api), "Service '{0}' not found!".format(service_name))
 
 
 @logwrap
@@ -165,28 +183,34 @@ def verify_network_list_api(os_conn, net_count=None):
 
 
 @logwrap
-def get_ceph_partitions(remote, device, type="xfs"):
-    ret = remote.check_call("parted {device} print | grep {type}".format(
-                            device=device, type=type))['stdout']
+def check_ceph_image_size(ip, expected_size, device='vdc'):
+    ret = ssh_manager.check_call(
+        ip=ip,
+        command="df -m /dev/{device}* | grep ceph | awk"
+                " {size}".format(device=device,
+                                 size=re.escape('{print $2}'))
+    ).stdout
+
     if not ret:
-        logger.error("Partition not present! {partitions}: ".format(
-                     remote.check_call("parted {device} print")))
-        raise Exception
+        logger.error(
+            "Partition not present! {}: ".format(
+                ssh_manager.check_call(ip=ip, command="df -m").stdout_str))
+        raise Exception()
     logger.debug("Partitions: {part}".format(part=ret))
-    return ret
+    assert_true(abs(float(ret[0].rstrip()) / expected_size - 1) < 0.1,
+                "size {0} is not equal"
+                " to {1}".format(ret[0].rstrip(),
+                                 expected_size))
 
 
 @logwrap
-def get_mongo_partitions(remote, device):
-    ret = remote.check_call("lsblk | grep {device} | awk {size}".format(
-                            device=device,
-                            size=re.escape('{print $4}')))['stdout']
-    if not ret:
-        logger.error("Partition not present! {partitions}: ".format(
-                     remote.check_call("parted {device} print")))
-        raise Exception
-    logger.debug("Partitions: {part}".format(part=ret))
-    return ret
+def check_cinder_image_size(ip, expected_size, device='vdc3'):
+    ret = get_mongo_partitions(ip, device)[0].rstrip().rstrip('G')
+    cinder_size = float(ret) * 1024
+    assert_true(abs(cinder_size / expected_size - 1) < 0.1,
+                "size {0} is not equal"
+                " to {1}".format(ret[0].rstrip(),
+                                 expected_size))
 
 
 @logwrap
@@ -211,233 +235,223 @@ def check_unallocated_space(disks, contr_img_ceph=False):
 
 
 @logwrap
-def check_upgraded_containers(remote, version_from, version_to):
-    containers = remote.execute("docker ps | tail -n +2 |"
-                                "awk '{ print $NF;}'")['stdout']
-    symlink = remote.execute("readlink /etc/supervisord.d/current")['stdout']
-    logger.debug('containers are {0}'.format(containers))
-    logger.debug('symlinks are {0}'.format(symlink))
-    components = [co.split('-') for x in containers for co in x.split(',')]
-
-    for i in components:
-        assert_true(version_from != i[2],
-                    'There are {0} containers'.format(version_from))
-    for i in components:
-        assert_true(version_to == i[2],
-                    'There are no {0} containers'.format(version_to))
-    assert_true('/etc/supervisord.d/{0}'.format(version_to)
-                in symlink[0],
-                'Symlink is set not to {0}'.format(version_to))
-
-
-@logwrap
-def upload_tarball(node_ssh, tar_path, tar_target):
-    assert_true(tar_path, "Source path for uploading 'tar_path' is empty, "
-                "please check test settings!")
-    check_archive_type(tar_path)
-    try:
-        logger.debug("Start to upload tar file")
-        node_ssh.upload(tar_path, tar_target)
-    except Exception:
-        logger.error('Failed to upload file')
-        logger.error(traceback.format_exc())
-
-
-@logwrap
 def check_archive_type(tar_path):
     if os.path.splitext(tar_path)[1] not in [".tar", ".lrz", ".fp", ".rpm"]:
         raise Exception("Wrong archive type!")
 
 
 @logwrap
-def check_tarball_exists(node_ssh, name, path):
-    result = ''.join(node_ssh.execute(
-        'ls -all {0} | grep {1}'.format(path, name))['stdout'])
-    assert_true(name in result, 'Can not find tarball')
+def check_file_exists(ip, path):
+    assert_true(ssh_manager.exists_on_remote(ip, path),
+                'Can not find {0}'.format(path))
+    logger.info('File {0} exists on {1}'.format(path, ip))
 
 
 @logwrap
-def untar(node_ssh, name, path):
-    filename, ext = os.path.splitext(name)
-    cmd = "tar -xpvf" if ext.endswith("tar") else "lrzuntar"
-    result = ''.join(node_ssh.execute(
-        'cd {0} && {2} {1}'.format(path, name, cmd))['stdout'])
-    logger.debug('Result from tar command is {0}'.format(result))
-
-
-@logwrap
-def run_script(node_ssh, script_path, script_name, password='admin',
-               rollback=False, exit_code=0):
-    path = os.path.join(script_path, script_name)
-    c_res = node_ssh.execute('chmod 755 {0}'.format(path))
-    logger.debug("Result of cmod is {0}".format(c_res))
-    if rollback:
-        path = "UPGRADERS='host-system docker openstack" \
-               " raise-error' {0}/{1}" \
-               " --password {2}".format(script_path, script_name, password)
-        chan, stdin, stderr, stdout = node_ssh.execute_async(path)
-        logger.debug('Try to read status code from chain...')
-        assert_equal(chan.recv_exit_status(), exit_code,
-                     'Upgrade script fails with next message {0}'.format(
-                         ''.join(stderr)))
-    else:
-        path = "{0}/{1} --no-rollback --password {2}".format(script_path,
-                                                             script_name,
-                                                             password)
-        chan, stdin, stderr, stdout = node_ssh.execute_async(path)
-        logger.debug('Try to read status code from chain...')
-        assert_equal(chan.recv_exit_status(), exit_code,
-                     'Upgrade script fails with next message {0}'.format(
-                         ''.join(stderr)))
-
-
-@logwrap
-def wait_upgrade_is_done(node_ssh, timeout, phrase):
-    cmd = "grep '{0}' /var/log/fuel_upgrade.log".format(phrase)
-    try:
-        wait(
-            lambda: not node_ssh.execute(cmd)['exit_code'], timeout=timeout)
-    except Exception as e:
-        a = node_ssh.execute(cmd)
-        logger.error(e)
-        assert_equal(0, a['exit_code'], a['stderr'])
-
-
-@logwrap
-def wait_rollback_is_done(node_ssh, timeout):
-    logger.debug('start waiting for rollback done')
+def wait_phrase_in_log(ip, timeout, interval, phrase, log_path):
+    cmd = "grep '{0}' '{1}'".format(phrase, log_path)
     wait(
-        lambda: not node_ssh.execute(
-            "grep 'UPGRADE FAILED' /var/log/fuel_upgrade.log"
-        )['exit_code'], timeout=timeout)
+        lambda: not SSHManager().execute(ip=ip, cmd=cmd)['exit_code'],
+        interval=interval,
+        timeout=timeout,
+        timeout_msg="The phrase {0} not found in {1} file on "
+                    "remote node".format(phrase, log_path))
 
 
 @logwrap
-def get_package_versions_from_node(remote, name, os_type):
-    if os_type and 'Ubuntu' in os_type:
-        cmd = "dpkg-query -W -f='${Version}' %s" % name
-    else:
-        cmd = "rpm -q {0}".format(name)
-    try:
-        result = ''.join(remote.execute(cmd)['stdout'])
-        return result.strip()
-    except Exception:
-        logger.error(traceback.format_exc())
-        raise
+def enable_feature_group(env, group):
+    fuel_settings = env.admin_actions.get_fuel_settings()
+    if group not in fuel_settings["FEATURE_GROUPS"]:
+        fuel_settings["FEATURE_GROUPS"].append(group)
+    env.admin_actions.save_fuel_settings(fuel_settings)
+
+    # NOTE(akostrikov) We use FUEL_SETTINGS_YAML as primary source or truth and
+    # update nailgun configs via puppet from that value
+    ssh_manager.check_call(
+        ip=ssh_manager.admin_ip,
+        command='puppet apply /etc/puppet/modules/fuel/examples/nailgun.pp'
+    )
+
+    def check_api_group_enabled():
+        try:
+            return (group in
+                    env.fuel_web.client.get_api_version()["feature_groups"])
+        except exceptions.HttpError:
+            return False
+
+    wait(check_api_group_enabled, interval=10, timeout=60 * 20,
+         timeout_msg='Failed to enable feature group - {!r}'.format(group))
 
 
-@logwrap
-def check_enable_experimental_mode(remote, path):
-        cmd = "sed '/feature_groups:" \
-              "/a \ \ \ \ - experimental' -i {0}".format(path)
-        result = remote.execute(cmd)
-        assert_equal(0, result['exit_code'], result['stderr'])
-
-
-@logwrap
-def restart_nailgun(remote):
-    cmd = 'dockerctl shell nailgun supervisorctl restart nailgun'
-    result = remote.execute(cmd)
-    assert_equal(0, result['exit_code'], result['stderr'])
-
-
-def find_backup(remote):
-    try:
-        arch_dir = ''.join(
-            remote.execute("ls -1u /var/backup/fuel/ | sed -n 1p")['stdout'])
-        arch_path = ''.join(
-            remote.execute("ls -1u /var/backup/fuel/{0}/*.lrz".
-                           format(arch_dir.strip()))["stdout"])
-        logger.debug('arch_path is {0}'.format(arch_path))
+def find_backup(ip):
+    backups = ssh_manager.execute(ip,
+                                  "ls -1u /var/backup/fuel/*/*.lrz")["stdout"]
+    if backups:
+        arch_path = backups[0]
+        logger.info('Backup archive found: {0}'.format(arch_path))
         return arch_path
-    except Exception as e:
-        logger.error('exception is {0}'.format(e))
-        raise e
+    else:
+        raise ValueError("No backup file found in the '/var/backup/fuel/'")
 
 
 @logwrap
-def backup_check(remote):
+def backup_check(ip):
     logger.info("Backup check archive status")
-    path = find_backup(remote)
-    assert_true(path, "Can not find backup. Path value {0}".format(path))
-    arch_result = ''.join(
-        remote.execute(("if [ -e {0} ]; "
-                        "then echo  Archive exists;"
-                        " fi").format(path.rstrip()))["stdout"])
-    assert_true("Archive exists" in arch_result, "Archive does not exist")
+    path = find_backup(ip)
+    assert_true(path, "Can not find backup. Path value '{0}'".format(path))
+    test_result = ssh_manager.execute(ip,
+                                      "test -e {0}".format(path.rstrip()))
+    assert_true(test_result['exit_code'] == 0,
+                "Archive '{0}' does not exist".format(path.rstrip()))
+
+
+_md5_record = re.compile(r'(?P<md5>\w+)[ \t]+(?P<filename>\w+)')
+
+
+def parse_md5sum_output(string):
+    """Process md5sum command output and return dict filename: md5
+
+    :param string: output of md5sum
+    :type string: str
+    :rtype: dict
+    :return: dict
+    """
+    return {filename: md5 for md5, filename in _md5_record.findall(string)}
+
+
+def diff_md5(before, after, no_dir_change=True):
+    """Diff md5sum output
+
+    :type before: str
+    :type after: str
+    :param no_dir_change: Check, that some files was added or removed
+    :type no_dir_change: bool
+    """
+    before_dict = parse_md5sum_output(before)
+    after_dict = parse_md5sum_output(after)
+
+    before_files = set(before_dict.keys())
+    after_files = set(after_dict.keys())
+
+    diff_filenames = before_files ^ after_files
+
+    dir_change = (
+        "Directory contents changed:\n"
+        "\tRemoved files: {removed}\n"
+        "\tNew files: {created}".format(
+            removed=[
+                filename for filename in diff_filenames
+                if filename in before_files],
+            created=[
+                filename for filename in diff_filenames
+                if filename in after_files],
+        )
+    )
+    if no_dir_change:
+        assert_true(len(diff_filenames) == 0, dir_change)
+    else:
+        logger.debug(dir_change)
+
+    changelist = [
+        {
+            'filename': filename,
+            'before': before_dict[filename],
+            'after': after_dict[filename]}
+        for filename in before_files & after_files
+        if before_dict[filename] != after_dict[filename]
+    ]
+    assert_true(
+        len(changelist) == 0,
+        "Files has been changed:\n"
+        "{}".format(
+            "".join(
+                map(
+                    lambda record: "{filename}: {before} -> {after}\n".format(
+                        **record),
+                    changelist
+                )
+            )
+        )
+    )
 
 
 @logwrap
-def restore_check_sum(remote):
+def restore_check_sum(ip):
     logger.debug('Check if removed file /etc/fuel/data was restored')
-    res = remote.execute("if [ -e /etc/fuel/data ]; "
-                         "then echo Restored!!;"
-                         " fi")
-    assert_true("Restored!!" in ''.join(res['stdout']).strip(),
-                'Test file /etc/fuel/data '
-                'was not restored!!! {0}'.format(res['stderr']))
+
+    assert_true(
+        ssh_manager.exists_on_remote(ip=ip, path='/etc/fuel/data'),
+        'Test file /etc/fuel/data was not restored!!!')
+
     logger.info("Restore check md5sum")
-    md5sum_backup = remote.execute("cat /etc/fuel/sum")
-    assert_true(''.join(md5sum_backup['stdout']).strip(),
+    md5sum_backup = ssh_manager.check_call(ip, "cat /etc/fuel/sum")
+    assert_true(md5sum_backup['stdout_str'],
                 'Command cat /etc/fuel/sum '
                 'failed with {0}'.format(md5sum_backup['stderr']))
-    md5sum_restore = remote.execute("md5sum /etc/fuel/data | sed -n 1p "
-                                    " | awk '{print $1}'")
-    assert_equal(md5sum_backup, md5sum_restore,
-                 "md5sums not equal: backup{0}, restore{1}".
-                 format(md5sum_backup, md5sum_restore))
+    md5sum_restore = ssh_manager.check_call(
+        ip=ip,
+        command="md5sum /etc/fuel/data | sed -n 1p | awk '{print $1}'"
+    )
+    assert_equal(
+        md5sum_backup.stdout_str, md5sum_restore.stdout_str,
+        "Checksum is not equal:\n"
+        "\tOLD: {0}\n"
+        "\tNEW: {1}".format(
+            md5sum_backup.stdout_str, md5sum_restore.stdout_str
+        )
+    )
 
 
 @logwrap
-def iptables_check(remote):
+def iptables_check(ip):
     logger.info("Iptables check")
-    remote.execute("iptables-save > /etc/fuel/iptables-restore")
-    iptables_backup = remote.execute("sed -e '/^:/d; /^#/d' "
-                                     " /etc/fuel/iptables-backup")
-    iptables_restore = remote.execute("sed -e '/^:/d; /^#/d' "
-                                      " /etc/fuel/iptables-restore")
+    ssh_manager.execute(ip, "iptables-save > /etc/fuel/iptables-restore")
+    iptables_backup = ssh_manager.execute(
+        ip=ip,
+        cmd="sed -e '/^:/d; /^#/d' /etc/fuel/iptables-backup"
+    )
+    iptables_restore = ssh_manager.execute(
+        ip=ip,
+        cmd="sed -e '/^:/d; /^#/d' /etc/fuel/iptables-restore"
+    )
     assert_equal(iptables_backup, iptables_restore,
                  "list of iptables rules are not equal")
 
 
 @logwrap
-def check_mysql(remote, node_name):
+def check_mysql(ip, node_name):
     check_cmd = 'pkill -0 -x mysqld'
-    check_crm_cmd = ('crm resource status clone_p_mysql |'
+    check_crm_cmd = ('crm resource status clone_p_mysqld |'
                      ' grep -q "is running on: $HOSTNAME"')
     check_galera_cmd = ("mysql --connect_timeout=5 -sse \"SELECT"
                         " VARIABLE_VALUE FROM"
                         " information_schema.GLOBAL_STATUS"
                         " WHERE VARIABLE_NAME"
                         " = 'wsrep_local_state_comment';\"")
-    try:
-        wait(lambda: remote.execute(check_cmd)['exit_code'] == 0,
-             timeout=300)
-        logger.info('MySQL daemon is started on {0}'.format(node_name))
-    except TimeoutError:
-        logger.error('MySQL daemon is down on {0}'.format(node_name))
-        raise
-    _wait(lambda: assert_equal(remote.execute(check_crm_cmd)['exit_code'], 0,
-                               'MySQL resource is NOT running on {0}'.format(
-                                   node_name)), timeout=60)
-    try:
-        wait(lambda: ''.join(remote.execute(
-            check_galera_cmd)['stdout']).rstrip() == 'Synced', timeout=600)
-    except TimeoutError:
-        logger.error('galera status is {0}'.format(''.join(remote.execute(
-            check_galera_cmd)['stdout']).rstrip()))
-        raise
 
+    wait(lambda: ssh_manager.execute(ip, check_cmd)['exit_code'] == 0,
+         timeout=10 * 60,
+         timeout_msg='MySQL daemon is down on {0}'.format(node_name))
+    logger.info('MySQL daemon is started on {0}'.format(node_name))
 
-@logwrap
-def install_plugin_check_code(
-        remote, plugin, exit_code=0):
-    cmd = "cd /var && fuel plugins --install {0} ".format(plugin)
-    chan, stdin, stderr, stdout = remote.execute_async(cmd)
-    logger.debug('Try to read status code from chain...')
-    assert_equal(
-        chan.recv_exit_status(), exit_code,
-        'Install script fails with next message {0}'.format(''.join(stderr)))
+    # TODO(astudenov): add timeout_msg
+    wait_pass(
+        lambda: assert_equal(
+            ssh_manager.execute(
+                ip,
+                check_crm_cmd)['exit_code'],
+            0,
+            'MySQL resource is NOT running on {0}'.format(node_name)),
+        timeout=120)
+    try:
+        wait(lambda: ''.join(ssh_manager.execute(
+            ip, check_galera_cmd)['stdout']).rstrip() == 'Synced', timeout=600,
+            timeout_msg='galera status != "Synced" on node {!r} with ip {}'
+                        ''.format(node_name, ip))
+    except TimeoutError:
+        logger.error('galera status is {0}'.format(''.join(ssh_manager.execute(
+            ip, check_galera_cmd)['stdout']).rstrip()))
+        raise
 
 
 @logwrap
@@ -593,10 +607,11 @@ def check_stats_on_collector(collector_remote, postgres_actions, master_uuid):
 
     # Check that important data (clusters number, nodes number, nodes roles,
     # user's email, used operation system, OpenStack stats) is saved correctly
-    for stat_type in general_stats.keys():
-        assert_true(type(summ_stats[stat_type]) == general_stats[stat_type],
-                    "Installation structure in Collector's DB doesn't contain"
-                    "the following stats: {0}".format(stat_type))
+    for stat_type in general_stats:
+        assert_true(
+            isinstance(summ_stats[stat_type], general_stats[stat_type]),
+            "Installation structure in Collector's DB doesn't contain"
+            "the following stats: {0}".format(stat_type))
 
     real_clusters_number = int(postgres_actions.run_query(
         db='nailgun', query='select count(*) from clusters;'))
@@ -652,7 +667,7 @@ def check_stats_private_info(collector_remote, postgres_actions,
         _has_private_data = False
         # Check that stats doesn't contain private data (e.g.
         # specific passwords, settings, emails)
-        for _private in private_data.keys():
+        for _private in private_data:
             _regex = r'(?P<key>"\S+"): (?P<value>[^:]*"{0}"[^:]*)'.format(
                 private_data[_private])
             for _match in re.finditer(_regex, data):
@@ -668,7 +683,7 @@ def check_stats_private_info(collector_remote, postgres_actions,
                 _has_private_data = True
         # Check that stats doesn't contain private types of data (e.g. any kind
         # of passwords)
-        for _data_type in secret_data_types.keys():
+        for _data_type in secret_data_types:
             _regex = (r'(?P<secret>"[^"]*{0}[^"]*": (\{{[^\}}]+\}}|\[[^\]+]\]|'
                       r'"[^"]+"))').format(secret_data_types[_data_type])
 
@@ -686,7 +701,7 @@ def check_stats_private_info(collector_remote, postgres_actions,
         return _has_private_data
 
     def _contain_public_ip(data, _used_networks):
-        _has_puplic_ip = False
+        _has_public_ip = False
         _ip_regex = (r'\b((\d|[1-9]\d|1\d{2}|2[0-4]\d|25[0-5])\.){3}'
                      r'(\d|[1-9]\d|1\d{2}|2[0-4]\d|25[0-5])\b')
         _not_public_regex = [
@@ -701,24 +716,26 @@ def check_stats_private_info(collector_remote, postgres_actions,
             # If IP address isn't public and doesn't belong to defined for
             # deployment pools (e.g. admin, public, storage), then skip it
             if any(re.search(_r, _match.group()) for _r in _not_public_regex) \
-                    and not any(IPAddress(_match.group()) in IPNetwork(net) for
+                    and not any(IPAddress(str(_match.group())) in
+                                IPNetwork(str(net)) for
                                 net in _used_networks):
                 continue
-            logger.debug('Usage statistics with piblic IP(s):\n {0}'.
+            logger.debug('Usage statistics with public IP(s):\n {0}'.
                          format(data))
             logger.error('Found public IP in usage statistics: "{0}"'.format(
                 _match.group()))
-            _has_puplic_ip = True
-        return _has_puplic_ip
+            _has_public_ip = True
+        return _has_public_ip
 
     private_data = {
         'hostname': _settings['HOSTNAME'],
         'dns_domain': _settings['DNS_DOMAIN'],
         'dns_search': _settings['DNS_SEARCH'],
         'dns_upstream': _settings['DNS_UPSTREAM'],
-        'fuel_password': _settings['FUEL_ACCESS']['password'] if
-        _settings['FUEL_ACCESS']['password'] != 'admin'
-        else 'DefaultPasswordIsNotAcceptableForSearch',
+        'fuel_password': (
+            _settings['FUEL_ACCESS']['password']
+            if _settings['FUEL_ACCESS']['password'] != 'admin'
+            else 'DefaultPasswordIsNotAcceptableForSearch'),
         'nailgun_password': _settings['postgres']['nailgun_password'],
         'keystone_password': _settings['postgres']['keystone_password'],
         'ostf_password': _settings['postgres']['ostf_password'],
@@ -777,47 +794,91 @@ def check_kernel(kernel, expected_kernel):
 
 
 @logwrap
-def external_dns_check(remote_slave):
+def external_dns_check(ip):
     logger.info("External dns check")
-    ext_dns_ip = ''.join(
-        remote_slave.execute("grep {0} /etc/resolv.dnsmasq.conf | "
-                             "awk {{'print $2'}}".
-                             format(EXTERNAL_DNS))["stdout"]).rstrip()
-    assert_equal(ext_dns_ip, EXTERNAL_DNS,
+    provided_dns = EXTERNAL_DNS
+    logger.debug("provided to test dns is {}".format(provided_dns))
+    cluster_dns = []
+    for dns in provided_dns:
+        ext_dns_ip = ''.join(
+            ssh_manager.execute(
+                ip=ip,
+                cmd="grep {0} /etc/resolv.dnsmasq.conf | "
+                    "awk {{'print $2'}}".format(dns)
+            )["stdout"]).rstrip()
+        cluster_dns.append(ext_dns_ip)
+    logger.debug("external dns in conf is {}".format(cluster_dns))
+    assert_equal(set(provided_dns), set(cluster_dns),
                  "/etc/resolv.dnsmasq.conf does not contain external dns ip")
     command_hostname = ''.join(
-        remote_slave.execute("host {0} | awk {{'print $5'}}"
-                             .format(PUBLIC_TEST_IP))
+        ssh_manager.execute(ip,
+                            "host {0} | awk {{'print $5'}}"
+                            .format(PUBLIC_TEST_IP))
         ["stdout"]).rstrip()
     hostname = 'google-public-dns-a.google.com.'
     assert_equal(command_hostname, hostname,
                  "Can't resolve hostname")
 
 
+def verify_bootstrap_on_node(ip, os_type, uuid=None):
+    os_type = os_type.lower()
+    if 'ubuntu' not in os_type:
+        raise Exception("Only Ubuntu are supported, "
+                        "you have chosen {0}".format(os_type))
+
+    logger.info("Verify bootstrap on slave {0}".format(ip))
+
+    cmd = 'cat /etc/*release'
+    output = ssh_manager.execute_on_remote(ip, cmd)['stdout_str'].lower()
+    assert_true(os_type in output,
+                "Slave {0} doesn't use {1} image for bootstrap "
+                "after {1} images were enabled, /etc/release "
+                "content: {2}".format(ip, os_type, output))
+    if not uuid:
+        return
+
+    with ssh_manager.open_on_remote(
+            ip=ip,
+            path='/etc/nailgun-agent/config.yaml') as f:
+        data = yaml.safe_load(f)
+
+    actual_uuid = data.get("runtime_uuid")
+    assert_equal(actual_uuid, uuid,
+                 "Actual uuid {0} is not the same as expected {1}"
+                 .format(actual_uuid, uuid))
+
+
 @logwrap
-def external_ntp_check(remote_slave, vrouter_vip):
+def external_ntp_check(ip, vrouter_vip):
     logger.info("External ntp check")
-    ext_ntp_ip = ''.join(
-        remote_slave.execute("awk '/^server +{0}/{{print $2}}' "
-                             "/etc/ntp.conf".
-                             format(EXTERNAL_NTP))["stdout"]).rstrip()
-    assert_equal(ext_ntp_ip, EXTERNAL_NTP,
+    provided_ntp = EXTERNAL_NTP
+    logger.debug("provided to test ntp is {}".format(provided_ntp))
+    cluster_ntp = []
+    for ntp in provided_ntp:
+        ext_ntp_ip = ''.join(
+            ssh_manager.execute(
+                ip=ip,
+                cmd="awk '/^server +{0}/{{print $2}}' "
+                    "/etc/ntp.conf".format(ntp))["stdout"]).rstrip()
+        cluster_ntp.append(ext_ntp_ip)
+    logger.debug("external ntp in conf is {}".format(cluster_ntp))
+    assert_equal(set(provided_ntp), set(cluster_ntp),
                  "/etc/ntp.conf does not contain external ntp ip")
     try:
         wait(
-            lambda: not is_ntpd_active(remote_slave, vrouter_vip), timeout=120)
+            lambda: is_ntpd_active(ip, vrouter_vip), timeout=120)
     except Exception as e:
         logger.error(e)
-        status = is_ntpd_active(remote_slave, vrouter_vip)
+        status = is_ntpd_active(ip, vrouter_vip)
         assert_equal(
             status, 1, "Failed updated ntp. "
                        "Exit code is {0}".format(status))
 
 
-def check_swift_ring(remote):
+def check_swift_ring(ip):
     for ring in ['object', 'account', 'container']:
-        res = ''.join(remote.execute(
-            "swift-ring-builder /etc/swift/{0}.builder".format(
+        res = ''.join(ssh_manager.execute(
+            ip, "swift-ring-builder /etc/swift/{0}.builder".format(
                 ring))['stdout'])
         logger.debug("swift ring builder information is {0}".format(res))
         balance = re.search('(\d+.\d+) balance', res).group(1)
@@ -826,10 +887,14 @@ def check_swift_ring(remote):
                     " balance is {0}".format(balance, ring))
 
 
-def check_oswl_stat(postgres_actions, remote_collector, master_uid,
+def check_oswl_stat(postgres_actions, nailgun_actions,
+                    remote_collector, master_uid,
                     operation='current',
-                    resources=['vm', 'flavor', 'volume', 'image',
-                               'tenant', 'keystone_user']):
+                    resources=None):
+    if resources is None:
+        resources = [
+            'vm', 'flavor', 'volume', 'image', 'tenant', 'keystone_user'
+        ]
     logger.info("Checking that all resources were collected...")
     expected_resource_count = {
         'current':
@@ -860,7 +925,27 @@ def check_oswl_stat(postgres_actions, remote_collector, master_uid,
     for resource in resources:
         q = "select resource_data from oswl_stats where" \
             " resource_type = '\"'\"'{0}'\"'\"';".format(resource)
-        resource_data = json.loads(postgres_actions.run_query('nailgun', q))
+
+        # pylint: disable=undefined-loop-variable
+        def get_resource():
+            result = postgres_actions.run_query('nailgun', q)
+            logger.debug("resource state is {}".format(result))
+            if not result:
+                return False
+            return (
+                len(json.loads(result)[operation]) >
+                expected_resource_count[operation][resource])
+        # pylint: enable=undefined-loop-variable
+
+        wait(get_resource, timeout=10,
+             timeout_msg="resource {} wasn't updated in db".format(resource))
+        q_result = postgres_actions.run_query('nailgun', q)
+        assert_true(q_result.strip() is not None,
+                    "Resource {0} is absent in 'oswl_stats' table, "
+                    "please check /var/log/nailgun/oswl_{0}"
+                    "_collectord.log on Fuel admin node for details."
+                    .format(resource))
+        resource_data = json.loads(q_result)
 
         logger.debug('db return {0}'.format(resource_data))
         assert_true(len(resource_data['added']) >
@@ -875,13 +960,24 @@ def check_oswl_stat(postgres_actions, remote_collector, master_uid,
                                                   operation][resource]))
 
     # check stat on collector side
+
+    def are_logs_sent():
+        sent_logs = postgres_actions.count_sent_action_logs(
+            table='oswl_stats')
+        result = sent_logs == 6
+        if not result:
+            nailgun_actions.force_fuel_stats_sending()
+        return result
+
+    wait(are_logs_sent, timeout=20,
+         timeout_msg='Logs status was not changed to sent in db')
     sent_logs_count = postgres_actions.count_sent_action_logs(
         table='oswl_stats')
     logger.info("Number of logs that were sent to collector: {}".format(
         sent_logs_count
     ))
     logger.debug('oswls are {}'.format(remote_collector.get_oswls(master_uid)))
-    logs = len(remote_collector.get_oswls(master_uid))
+    logs = remote_collector.get_oswls(master_uid)['paging_params']['total']
     logger.info("Number of logs that were saved"
                 " on collector: {}".format(logs))
     assert_true(sent_logs_count <= int(logs),
@@ -909,20 +1005,9 @@ def check_oswl_stat(postgres_actions, remote_collector, master_uid,
 
 
 @logwrap
-def get_file_size(remote, file_name, file_path):
-    file_size = remote.execute(
-        'stat -c "%s" {0}/{1}'.format(file_path, file_name))
-    assert_equal(
-        int(file_size['exit_code']), 0, "Failed to get '{0}/{1}' file stats on"
-                                        " remote node".format(file_path,
-                                                              file_name))
-    return int(file_size['stdout'][0].rstrip())
-
-
-@logwrap
-def check_ping(remote, host, deadline=10, size=56, timeout=1, interval=1):
+def check_ping(ip, host, deadline=10, size=56, timeout=1, interval=1):
     """Check network connectivity from remote to host using ICMP (ping)
-    :param remote: SSHClient
+    :param ip: remote ip
     :param host: string IP address or host/domain name
     :param deadline: time in seconds before ping exits
     :param size: size of data to be sent
@@ -930,100 +1015,115 @@ def check_ping(remote, host, deadline=10, size=56, timeout=1, interval=1):
     :param interval: wait interval seconds between sending each packet
     :return: bool: True if ping command
     """
+    ssh_manager = SSHManager()
     cmd = ("ping -W {timeout} -i {interval} -s {size} -c 1 -w {deadline} "
            "{host}".format(host=host,
                            size=size,
                            timeout=timeout,
                            interval=interval,
                            deadline=deadline))
-    return int(remote.execute(cmd)['exit_code']) == 0
+    res = ssh_manager.execute(ip, cmd)
+    return int(res['exit_code']) == 0
 
 
 @logwrap
-def check_nova_dhcp_lease(remote, instance_ip, instance_mac, node_dhcp_ip):
+def check_neutron_dhcp_lease(ip, instance_ip, instance_mac,
+                             dhcp_server_ip, dhcp_port_tag):
+    """Check if the DHCP server offers a lease for a client with the specified
+       MAC address
+       :param ip: remote IP
+       :param str instance_ip: IP address of instance
+       :param str instance_mac: MAC address that will be checked
+       :param str dhcp_server_ip: IP address of DHCP server for request a lease
+       :param str dhcp_port_tag: OVS port tag used for access the DHCP server
+       :return bool: True if DHCP lease for the 'instance_mac' was obtained
+    """
     logger.debug("Checking DHCP server {0} for lease {1} with MAC address {2}"
-                 .format(node_dhcp_ip, instance_ip, instance_mac))
-    res = remote.execute('ip link add dhcptest0 type veth peer name dhcptest1;'
-                         'brctl addif br100 dhcptest0;'
-                         'ifconfig dhcptest0 up;'
-                         'ifconfig dhcptest1 hw ether {1};'
-                         'ifconfig dhcptest1 up;'
-                         'dhcpcheck request dhcptest1 {2} --range_start {0} '
-                         '--range_end 255.255.255.255 | fgrep \" {2} \";'
-                         'ifconfig dhcptest1 down;'
-                         'ifconfig dhcptest0 down;'
-                         'brctl delif br100 dhcptest0;'
-                         'ip link delete dhcptest0;'
-                         .format(instance_ip, instance_mac, node_dhcp_ip))
-    res_str = ''.join(res['stdout'])
-    logger.debug("DHCP server answer: {}".format(res_str))
-    return ' ack ' in res_str
+                 .format(dhcp_server_ip, instance_ip, instance_mac))
+    ovs_port_name = 'tapdhcptest1'
+    ovs_cmd = '/usr/bin/ovs-vsctl --timeout=10 --oneline --format=json -- '
+    ovs_add_port_cmd = ("--if-exists del-port {0} -- "
+                        "add-port br-int {0} -- "
+                        "set Interface {0} type=internal -- "
+                        "set Port {0} tag={1}"
+                        .format(ovs_port_name, dhcp_port_tag))
+    ovs_del_port_cmd = ("--if-exists del-port {0}".format(ovs_port_name))
+
+    # Add an OVS interface with a tag for accessing the DHCP server
+    ssh_manager.execute_on_remote(ip, ovs_cmd + ovs_add_port_cmd)
+
+    # Set to the created interface the same MAC address
+    # that was used for the instance.
+    ssh_manager.execute_on_remote(
+        ip, "ifconfig {0} hw ether {1}".format(ovs_port_name,
+                                               instance_mac))
+    ssh_manager.execute_on_remote(ip, "ifconfig {0} up".format(ovs_port_name))
+
+    # Perform a 'dhcpcheck' request to check if the lease can be obtained
+    lease = ssh_manager.execute_on_remote(
+        ip=ip,
+        cmd="dhcpcheck request {0} {1} --range_start {2} "
+            "--range_end 255.255.255.255 | fgrep \" {1} \""
+            .format(ovs_port_name, dhcp_server_ip, instance_ip))['stdout']
+
+    # Remove the OVS interface
+    ssh_manager.execute_on_remote(ip, ovs_cmd + ovs_del_port_cmd)
+
+    logger.debug("DHCP server answer: {}".format(lease))
+    return ' ack ' in lease
 
 
-def check_available_mode(remote):
-    command = ('umm status | grep runlevel &>/dev/null && echo "True" '
-               '|| echo "False"')
-    if remote.execute(command)['exit_code'] == 0:
-        return ''.join(remote.execute(command)['stdout']).strip()
-    else:
-        return ''.join(remote.execute(command)['stderr']).strip()
-
-
-def check_auto_mode(remote):
-    command = ('umm status | grep umm &>/dev/null && echo "True" '
-               '|| echo "False"')
-    if remote.execute(command)['exit_code'] == 0:
-        return ''.join(remote.execute(command)['stdout']).strip()
-    else:
-        return ''.join(remote.execute(command)['stderr']).strip()
-
-
-def is_ntpd_active(remote, ntpd_ip):
+def is_ntpd_active(ip, ntpd_ip):
     cmd = 'ntpdate -d -p 4 -t 0.2 -u {0}'.format(ntpd_ip)
-    return (not remote.execute(cmd)['exit_code'])
+    return not ssh_manager.execute(ip, cmd)['exit_code']
 
 
-def check_repo_managment(remote):
-    """Check repo managment
+def check_repo_managment(ip):
+    """Check repo management
 
     run 'yum -y clean all && yum check-update' or
         'apt-get clean all && apt-get update' exit code should be 0
 
-    :type devops_node: Node
-        :rtype True or False
+    :type ip: node ip
+        :rtype Dict
     """
     if OPENSTACK_RELEASE == OPENSTACK_RELEASE_UBUNTU:
-        cmd = "apt-get clean all && apt-get update > /dev/null 2>&1"
+        cmd = "apt-get clean all && apt-get update > /dev/null"
     else:
-        cmd = "yum -y clean all && yum check-update > /dev/null 2>&1"
-    remote.check_call(cmd)
+        cmd = "yum -y clean all && yum check-update > /dev/null"
+    ssh_manager.execute_on_remote(
+        ip=ip,
+        cmd=cmd
+    )
 
 
-def check_public_ping(remotes):
+def check_public_ping(ip):
     """ Check if ping public vip
-    :type remotes: list
+    :type ip: node ip
     """
     cmd = ('ruby /etc/puppet/modules/osnailyfacter/'
            'modular/virtual_ips/public_vip_ping_post.rb')
-    for remote in remotes:
-        res = remote.execute(cmd)
-        assert_equal(0, res['exit_code'],
-                     'Public ping check failed:'
-                     ' {0}'.format(res))
+    ssh_manager.execute_on_remote(
+        ip=ip,
+        cmd=cmd,
+        err_msg='Public ping check failed'
+    )
 
 
-def check_cobbler_node_exists(remote, node_id):
+def check_cobbler_node_exists(ip, node_id):
     """Check node with following node_id
     is present in the cobbler node list
-    :param remote: SSHClient
+    :param ip: node ip
     :param node_id: fuel node id
     :return: bool: True if exit code of command (node) == 0
     """
     logger.debug("Check that cluster contains node with ID:{0} ".
                  format(node_id))
-    node = remote.execute(
-        'dockerctl shell cobbler bash -c "cobbler system list" | grep '
-        '-w "node-{0}"'.format(node_id))
+    node = ssh_manager.execute(
+        ip=ip,
+        cmd='bash -c "cobbler system list" | grep '
+            '-w "node-{0}"'.format(node_id)
+    )
     return int(node['exit_code']) == 0
 
 
@@ -1035,7 +1135,7 @@ def check_cluster_presence(cluster_id, postgres_actions):
     return str(cluster_id) in query_result
 
 
-def check_haproxy_backend(remote,
+def check_haproxy_backend(ip,
                           services=None, nodes=None,
                           ignore_services=None, ignore_nodes=None):
     """Check DOWN state of HAProxy backends. Define names of service or nodes
@@ -1043,8 +1143,8 @@ def check_haproxy_backend(remote,
     service status on all nodes. Use ignore_nodes for ignore all services on
     all nodes. Ignoring has a bigger priority.
 
-    :type remote: SSHClient
-    :type service: List
+    :type ip: node ip
+    :type services: List
     :type nodes: List
     :type ignore_services: List
     :type ignore_nodes: List
@@ -1053,9 +1153,334 @@ def check_haproxy_backend(remote,
     cmd = 'haproxy-status | egrep -v "BACKEND|FRONTEND" | grep "DOWN"'
 
     positive_filter = (services, nodes)
-    negativ_filter = (ignore_services, ignore_nodes)
+    negative_filter = (ignore_services, ignore_nodes)
     grep = ['|egrep "{}"'.format('|'.join(n)) for n in positive_filter if n]
     grep.extend(
-        ['|egrep -v "{}"'.format('|'.join(n)) for n in negativ_filter if n])
+        ['|egrep -v "{}"'.format('|'.join(n)) for n in negative_filter if n])
 
-    return remote.execute("{}{}".format(cmd, ''.join(grep)))
+    result = ssh_manager.execute(
+        ip=ip,
+        cmd="{}{}".format(cmd, ''.join(grep))
+    )
+    return result
+
+
+def check_log_lines_order(ip, log_file_path, line_matcher):
+    """Read log file and check that lines order are same as strings in list
+
+    :param ip: ip of node in str format
+    :param log_file_path: path to log file
+    :param line_matcher: list of strings to search
+    """
+    check_file_exists(ip, path=log_file_path)
+
+    previous_line_pos = 1
+    previous_line = None
+    for current_line in line_matcher:
+        cmd = 'tail -n +{0} {1} | grep -n "{2}"'\
+            .format(previous_line_pos, log_file_path, current_line)
+
+        result = ssh_manager.execute_on_remote(
+            ip=ip,
+            cmd=cmd,
+            err_msg="Line '{0}' not found after line '{1}' in the file "
+                    "'{2}'.".format(current_line, previous_line, log_file_path)
+
+        )
+
+        # few lines found case
+        assert_equal(1,
+                     len(result['stdout']),
+                     "Found {0} lines like {1} but should be only 1 in {2}"
+                     " Command '{3}' executed with exit_code='{4}'\n"
+                     "stdout:\n* {5} *\n"
+                     "stderr:\n'* {6} *\n"
+                     .format(len(result['stdout']),
+                             current_line,
+                             log_file_path,
+                             cmd,
+                             result['exit_code'],
+                             '\n'.join(result['stdout']),
+                             '\n'.join(result['stderr'])))
+
+        current_line_pos = int(result['stdout'][0].split(':')[0])
+
+        previous_line_pos += current_line_pos
+        previous_line = current_line
+
+
+def check_hiera_hosts(nodes, cmd):
+    hiera_hosts = []
+    for node in nodes:
+        result = ssh_manager.execute_on_remote(
+            ip=node['ip'],
+            cmd=cmd
+        )['stdout_str']
+        hosts = result.split(',')
+        logger.debug("hosts on {0} are {1}".format(node['hostname'], hosts))
+
+        if not hiera_hosts:
+            hiera_hosts = hosts
+            continue
+        else:
+            assert_true(set(hosts) == set(hiera_hosts),
+                        'Hosts on node {0} differ from'
+                        ' others'.format(node['hostname']))
+
+
+def check_client_smoke(ip):
+    fuel_output = ssh_manager.execute(
+        ip=ip,
+        cmd='fuel env list'
+    )['stdout'][2].split('|')[2].strip()
+    fuel_2_output = ssh_manager.execute(
+        ip=ip,
+        cmd='fuel2 env list'
+    )['stdout'][3].split('|')[3].strip()
+    assert_equal(fuel_output, fuel_2_output,
+                 "The fuel: {0} and fuel2: {1} outputs are not equal")
+
+
+def check_offload(ip, interface, offload_type):
+    command = ("ethtool --show-offload {0} | awk '/{1}/' "
+               "| cut -d ':' -f 2").format(interface, offload_type)
+
+    result = ssh_manager.execute_on_remote(
+        ip=ip,
+        cmd=command,
+        err_msg=("Failed to get Offload {0} "
+                 "on node {1}").format(offload_type, ip)
+    )
+    return result['stdout_str']
+
+
+def check_get_network_data_over_cli(ip, cluster_id, path):
+    logger.info("Download network data over cli")
+    cmd = 'fuel --debug --env {0} network --dir {1} --json -d'.format(
+        cluster_id, path)
+    ssh_manager.execute_on_remote(
+        ip=ip,
+        cmd=cmd,
+        err_msg='Failed to upload network data'
+    )
+
+
+def check_update_network_data_over_cli(ip, cluster_id, path):
+    logger.info("Upload network data over cli")
+    cmd = 'fuel --debug --env {0} network --dir {1} --json -u'.format(
+        cluster_id, path)
+    ssh_manager.execute_on_remote(
+        ip=ip,
+        cmd=cmd,
+        err_msg='Failed to upload network data'
+    )
+
+
+def check_plugin_path_env(var_name, plugin_path):
+    assert_true(
+        plugin_path,
+        '{var_name:s} variable is not set or set incorrectly: '
+        '{plugin_path!r}'.format(
+            var_name=var_name,
+            plugin_path=plugin_path)
+    )
+    assert_true(
+        os.path.exists(plugin_path),
+        'File {plugin_path:s} (variable: {var_name:s}) does not exists!'
+        ''.format(plugin_path=plugin_path, var_name=var_name)
+    )
+
+
+def incomplete_tasks(tasks, cluster_id=None):
+    def get_last_tasks():
+        last_tasks = {}
+        for tsk in tasks:
+            if cluster_id is not None and cluster_id != tsk['cluster']:
+                continue
+            if (tsk['cluster'], tsk['name']) not in last_tasks:
+                last_tasks[(tsk['cluster'], tsk['name'])] = tsk
+        return last_tasks
+
+    deploy_tasks = {}
+    not_ready_tasks = {}
+    allowed_statuses = {'ready', 'skipped'}
+
+    for (task_cluster, task_name), task in get_last_tasks().items():
+        if task_name == 'deployment':
+            deploy_tasks[task['cluster']] = task['id']
+        if task['status'] not in allowed_statuses:
+            if task_cluster not in not_ready_tasks:
+                not_ready_tasks[task_cluster] = []
+            not_ready_tasks[task_cluster].append(task)
+
+    return not_ready_tasks, deploy_tasks
+
+
+def incomplete_deploy(deployment_tasks):
+    allowed_statuses = {'ready', 'skipped'}
+    not_ready_deploy = {}
+
+    for cluster_id, tasks in deployment_tasks.items():
+        not_ready_jobs = {}
+        for task in filter(
+                lambda tsk: tsk['status'] not in allowed_statuses,
+                tasks):
+            if task['node_id'] not in not_ready_jobs:
+                not_ready_jobs[task['node_id']] = []
+            not_ready_jobs[task['node_id']].append(task)
+        if not_ready_jobs:
+            not_ready_deploy[cluster_id] = not_ready_jobs
+
+    return not_ready_deploy
+
+
+def fail_deploy(not_ready_transactions):
+    if len(not_ready_transactions) > 0:
+        cluster_info_template = "\n\tCluster ID: {cluster}{info}\n"
+        task_details_template = (
+            "\n"
+            "\t\t\tTask name: {deployment_graph_task_name}\n"
+            "\t\t\t\tStatus: {status}\n"
+            "\t\t\t\tStart:  {time_start}\n"
+            "\t\t\t\tEnd:    {time_end}\n"
+        )
+
+        failure_text = 'Not all deployments tasks completed: {}'.format(
+            ''.join(
+                cluster_info_template.format(
+                    cluster=cluster,
+                    info="".join(
+                        "\n\t\tNode: {node_id}{details}\n".format(
+                            node_id=node_id,
+                            details="".join(
+                                task_details_template.format(**task)
+                                for task in sorted(
+                                    tasks,
+                                    key=lambda item: item['status'])
+                            ))
+                        for node_id, tasks in sorted(records.items())
+                    ))
+                for cluster, records in sorted(not_ready_transactions.items())
+            ))
+        logger.error(failure_text)
+        assert_true(len(not_ready_transactions) == 0, failure_text)
+
+
+def check_free_space_admin(env, min_disk_admin=50, disk_id=0):
+    """Calculate available free space on /var and /var/log/ disk partitions
+
+    :param env: environment model object
+    :param min_disk_admin: minimal disk size of admin node
+    :param disk_id: id of disk in the admin node's list of disks
+    """
+    disk_size_admin = env.d_env.nodes().admin.disk_devices[
+        disk_id].volume.get_capacity()
+    min_disk_admin *= 1024 ** 3
+    if disk_size_admin < min_disk_admin:
+        raise ValueError(
+            "The minimal disk size should be {0}, current {1}".format(
+                min_disk_admin, disk_size_admin))
+    admin_ip = env.ssh_manager.admin_ip
+    var_free_space = ssh_manager.check_call(
+        ip=admin_ip,
+        command="df -h /var")['stdout'][1].split()[3][:-1]
+    system_dirs = ['/boot/efi', '/boot$', 'docker-docker--pool', 'SWAP',
+                   'os-root']
+    system_dirs_size = 0
+    for sys_dir in system_dirs:
+        system_dir = ssh_manager.check_call(
+            ip=admin_ip,
+            command="lsblk -b | grep -we  {0}  | tail -1".format(
+                sys_dir))['stdout'][0]
+        system_dir = int(re.findall(r"\D(\d{9,12})\D", system_dir)[0])
+        system_dirs_size += system_dir
+    system_files_var = int(ssh_manager.check_call(
+        ip=admin_ip,
+        command="df -B1 /var")['stdout'][1].split()[2])
+    init_size = (min_disk_admin - system_dirs_size)
+    min_var_free_space = (init_size * 0.4 - system_files_var) / 1024 ** 3
+    if var_free_space < min_var_free_space:
+        raise ValueError(
+            "The minimal /var size should be {0}, current {1}".format(
+                min_var_free_space, var_free_space))
+    system_files_log = int(ssh_manager.check_call(
+        ip=admin_ip,
+        command="df -B1 /var/log")['stdout'][1].split()[2])
+    min_log_free_space = (init_size * 0.6 - system_files_log) / 1024 ** 3
+    log_free_space = ssh_manager.check_call(
+        ip=admin_ip,
+        command="df -h /var/log")['stdout'][1].split()[3][:-1]
+    if log_free_space < min_log_free_space:
+        raise ValueError(
+            "The minimal /var/log size should be {0}, current {1}".format(
+                min_log_free_space, log_free_space))
+
+
+def check_free_space_slave(env, min_disk_slave=150):
+    """Calculate available free space on /var/lib/nova disk partition
+
+    :param env: environment model object
+    :param min_disk_slave: minimal disk size of slave node
+    """
+    min_disk_slave *= 1024 ** 3
+    disk_size_slave = 0
+    active_nodes = []
+    for node in env.d_env.nodes().slaves:
+        if node.driver.node_active(node):
+            active_nodes.append(node)
+    for slave_id in xrange(len(active_nodes)):
+        volume_slave_numb = len(
+            env.d_env.nodes().slaves[slave_id].disk_devices)
+        for disk_id in xrange(volume_slave_numb):
+            volume_size = env.d_env.nodes().slaves[slave_id].disk_devices[
+                disk_id].volume.get_capacity()
+            disk_size_slave += volume_size
+        if disk_size_slave < min_disk_slave:
+            raise ValueError(
+                "The minimal disk size should be {0}, current {1}".format(
+                    min_disk_slave, disk_size_slave))
+    cluster_id = env.fuel_web.get_last_created_cluster()
+    compute_ip = [compute['ip'] for compute in
+                  env.fuel_web.get_nailgun_cluster_nodes_by_roles(
+                      cluster_id, ['compute'])]
+    if compute_ip:
+        small_flavor_disk = 20
+        for ip in compute_ip:
+            vm_storage_free_space = ssh_manager.check_call(
+                ip=ip,
+                command="df -h /var/lib/nova")['stdout'][1].split()[3][:-1]
+            if vm_storage_free_space < 4 * small_flavor_disk:
+                raise ValueError(
+                    "The minimal vm-nova storage size should be {0}, "
+                    "current {1}".format(
+                        vm_storage_free_space, 4 * small_flavor_disk))
+
+
+@logwrap
+def check_package_version(ip, package_name, expected_version, condition='ge'):
+    """Check that package version equal/not equal/greater/less than expected
+
+    :param ip: ip
+    :param package_name: package name to check
+    :param expected_version: expected version of package
+    :param condition: predicate can be on of eq, ne, lt, le, ge, gt
+    :return None: or raise UnexpectedExitCode
+    """
+    cmd = "dpkg -s {0} " \
+          "| awk -F': ' '/Version/ {{print \$2}}'".format(package_name)
+    logger.debug(cmd)
+    result = ssh_manager.execute_on_remote(
+        ip,
+        cmd=cmd,
+        assert_ec_equal=[0]
+    )
+    version = result['stdout_str']
+    logger.info('{} ver is {}'.format(package_name, version))
+    err_msg = 'Package {} version is {} and not {} {}'.format(package_name,
+                                                              version,
+                                                              condition,
+                                                              expected_version)
+    cmd = 'dpkg --compare-versions {0} {1} {2}'.format(version, condition,
+                                                       expected_version)
+    ssh_manager.execute_on_remote(ip, cmd, assert_ec_equal=[0],
+                                  err_msg=err_msg)

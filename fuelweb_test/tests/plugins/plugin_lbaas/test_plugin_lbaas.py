@@ -18,13 +18,13 @@ from devops.helpers.helpers import wait
 from proboscis import asserts
 from proboscis import test
 
+from fuelweb_test.helpers.checkers import check_plugin_path_env
 from fuelweb_test.helpers.decorators import log_snapshot_after_test
 from fuelweb_test.helpers import os_actions
-from fuelweb_test.helpers import checkers
+from fuelweb_test.helpers import utils
 from fuelweb_test import logger
 from fuelweb_test.settings import DEPLOYMENT_MODE_SIMPLE
 from fuelweb_test.settings import LBAAS_PLUGIN_PATH
-from fuelweb_test.settings import NEUTRON_SEGMENT_TYPE
 from fuelweb_test.tests.base_test_case import SetupEnvironment
 from fuelweb_test.tests.base_test_case import TestBasic
 
@@ -32,6 +32,12 @@ from fuelweb_test.tests.base_test_case import TestBasic
 @test(enabled=False, groups=["plugins"])
 class LbaasPlugin(TestBasic):
     """LbaasPlugin."""  # TODO documentation
+    def __init__(self):
+        super(LbaasPlugin, self).__init__()
+        check_plugin_path_env(
+            var_name='LBAAS_PLUGIN_PATH',
+            plugin_path=LBAAS_PLUGIN_PATH
+        )
 
     @classmethod
     def check_neutron_agents_statuses(cls, os_conn):
@@ -55,7 +61,7 @@ class LbaasPlugin(TestBasic):
             'There is not LbaaS agent in neutron agent list output')
 
     @classmethod
-    def check_lbass_work(cls, os_conn):
+    def check_lbaas_work(cls, os_conn):
         # create pool
         pool = os_conn.create_pool(pool_name='lbaas_pool')
 
@@ -114,23 +120,20 @@ class LbaasPlugin(TestBasic):
         self.env.revert_snapshot("ready_with_3_slaves")
 
         # copy plugin to the master node
-
-        checkers.upload_tarball(
-            self.env.d_env.get_admin_remote(), LBAAS_PLUGIN_PATH, '/var')
+        utils.upload_tarball(
+            ip=self.ssh_manager.admin_ip,
+            tar_path=LBAAS_PLUGIN_PATH,
+            tar_target='/var')
 
         # install plugin
 
-        checkers.install_plugin_check_code(
-            self.env.d_env.get_admin_remote(),
+        utils.install_plugin_check_code(
+            ip=self.ssh_manager.admin_ip,
             plugin=os.path.basename(LBAAS_PLUGIN_PATH))
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
             mode=DEPLOYMENT_MODE_SIMPLE,
-            settings={
-                "net_provider": 'neutron',
-                "net_segment_type": NEUTRON_SEGMENT_TYPE,
-            }
         )
 
         plugin_name = 'lbaas'
@@ -162,7 +165,7 @@ class LbaasPlugin(TestBasic):
 
         self.check_neutron_agents_statuses(os_conn)
 
-        self.check_lbass_work(os_conn)
+        self.check_lbaas_work(os_conn)
 
         self.fuel_web.run_ostf(
             cluster_id=cluster_id)
@@ -199,23 +202,19 @@ class LbaasPlugin(TestBasic):
         self.env.revert_snapshot("ready_with_3_slaves")
 
         # copy plugin to the master node
-
-        checkers.upload_tarball(
-            self.env.d_env.get_admin_remote(), LBAAS_PLUGIN_PATH, '/var')
+        utils.upload_tarball(
+            ip=self.ssh_manager.admin_ip,
+            tar_path=LBAAS_PLUGIN_PATH,
+            tar_target='/var')
 
         # install plugin
-
-        checkers.install_plugin_check_code(
-            self.env.d_env.get_admin_remote(),
+        utils.install_plugin_check_code(
+            ip=self.ssh_manager.admin_ip,
             plugin=os.path.basename(LBAAS_PLUGIN_PATH))
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
             mode=DEPLOYMENT_MODE_SIMPLE,
-            settings={
-                "net_provider": 'neutron',
-                "net_segment_type": NEUTRON_SEGMENT_TYPE,
-            }
         )
 
         plugin_name = 'lbaas'
@@ -246,7 +245,7 @@ class LbaasPlugin(TestBasic):
 
         self.check_neutron_agents_statuses(os_conn)
 
-        self.check_lbass_work(os_conn)
+        self.check_lbaas_work(os_conn)
 
         self.fuel_web.stop_reset_env_wait(cluster_id)
 
@@ -264,7 +263,7 @@ class LbaasPlugin(TestBasic):
 
         self.check_neutron_agents_statuses(os_conn)
 
-        self.check_lbass_work(os_conn)
+        self.check_lbaas_work(os_conn)
         self.fuel_web.run_ostf(
             cluster_id=cluster_id)
 

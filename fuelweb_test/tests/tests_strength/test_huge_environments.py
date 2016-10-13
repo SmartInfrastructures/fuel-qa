@@ -20,8 +20,10 @@ from fuelweb_test.tests import base_test_case
 from fuelweb_test.helpers import os_actions
 
 
-@test(groups=["huge_environments", "huge_ha_nova"])
+@test(enabled=False,
+      groups=["huge_environments", "huge_ha_nova"])
 class HugeEnvironments(base_test_case.TestBasic):
+    # REMOVE THIS NOVA_NETWORK CLASS WHEN NEUTRON BE DEFAULT
     """HugeEnvironments."""  # TODO documentation
 
     @test(depends_on=[base_test_case.SetupEnvironment.prepare_slaves_9],
@@ -112,6 +114,7 @@ class HugeEnvironments(base_test_case.TestBasic):
                 'volumes_ceph': True,
                 'images_ceph': False,
                 'volumes_lvm': False,
+                'osd_pool_size': '2',
                 'sahara': True,
                 'ceilometer': True
             }
@@ -143,18 +146,17 @@ class HugeEnvironments(base_test_case.TestBasic):
 
         self.fuel_web.run_ostf(
             cluster_id=cluster_id,
-            test_sets=['ha', 'smoke', 'sanity'],
-            should_fail=1)
+            test_sets=['ha', 'smoke', 'sanity'])
 
 
 @test(groups=["huge_environments", "huge_ha_neutron", "huge_scale"])
 class HugeHaNeutron(base_test_case.TestBasic):
 
     @test(depends_on=[base_test_case.SetupEnvironment.prepare_slaves_9],
-          groups=["huge_ha_neutron_gre_ceph_ceilometer_rados"])
+          groups=["huge_ha_neutron_tun_ceph_ceilometer_rados"])
     @log_snapshot_after_test
-    def huge_ha_neutron_gre_ceph_ceilometer_rados(self):
-        """Deploy cluster in HA mode with Neutron GRE, RadosGW
+    def huge_ha_neutron_tun_ceph_ceilometer_rados(self):
+        """Deploy cluster in HA mode with Neutron VXLAN, RadosGW
 
         Scenario:
             1. Create cluster
@@ -178,10 +180,10 @@ class HugeHaNeutron(base_test_case.TestBasic):
             'objects_ceph': True,
             'ceilometer': True,
             'net_provider': 'neutron',
-            'net_segment_type': 'gre',
-            'tenant': 'haGreCephHugeScale',
-            'user': 'haGreCephHugeScale',
-            'password': 'haGreCephHugeScale'
+            'net_segment_type': settings.NEUTRON_SEGMENT['tun'],
+            'tenant': 'haVxlanCephHugeScale',
+            'user': 'haVxlanCephHugeScale',
+            'password': 'haVxlanCephHugeScale'
         }
 
         cluster_id = self.fuel_web.create_cluster(
@@ -219,8 +221,7 @@ class HugeHaNeutron(base_test_case.TestBasic):
             data['user'],
             data['password'],
             data['tenant'])
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=15, networks_count=2, timeout=300)
+        self.fuel_web.assert_cluster_ready(os_conn, smiles_count=15)
 
         self.fuel_web.run_ostf(cluster_id=cluster_id,
                                test_sets=['ha', 'smoke', 'sanity'])
@@ -266,8 +267,9 @@ class HugeHaNeutron(base_test_case.TestBasic):
             'images_ceph': True,
             'volumes_lvm': False,
             'objects_ceph': True,
+            'osd_pool_size': '2',
             'net_provider': 'neutron',
-            'net_segment_type': 'vlan',
+            'net_segment_type': settings.NEUTRON_SEGMENT['vlan'],
             'tenant': 'haVlanCephHugeScale',
             'user': 'haVlanCephHugeScale',
             'password': 'haVlanCephHugeScale'
@@ -307,8 +309,7 @@ class HugeHaNeutron(base_test_case.TestBasic):
             data['user'],
             data['password'],
             data['tenant'])
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=15, networks_count=2, timeout=300)
+        self.fuel_web.assert_cluster_ready(os_conn, smiles_count=15)
 
         self.fuel_web.run_ostf(cluster_id=cluster_id,
                                test_sets=['ha', 'smoke', 'sanity'])

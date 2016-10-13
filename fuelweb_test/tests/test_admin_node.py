@@ -12,34 +12,49 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from __future__ import division
+from warnings import warn
+
 import datetime
+import random
+import re
 
 from devops.helpers.helpers import http
 from devops.helpers.helpers import wait
 from proboscis.asserts import assert_equal
 from proboscis.asserts import assert_true
-from proboscis import SkipTest
 from proboscis import test
-import xmlrpclib
+from proboscis import SkipTest
+# pylint: disable=import-error
+# noinspection PyUnresolvedReferences
+from six.moves.urllib.request import urlopen
+# noinspection PyUnresolvedReferences
+from six.moves.xmlrpc_client import ServerProxy
+# pylint: enable=import-error
 
-from fuelweb_test.helpers import checkers
 from fuelweb_test.helpers.decorators import log_snapshot_after_test
-from fuelweb_test.settings import OPENSTACK_RELEASE
-from fuelweb_test.settings import OPENSTACK_RELEASE_CENTOS
+from fuelweb_test import logger
+from fuelweb_test import settings
 from fuelweb_test.tests.base_test_case import SetupEnvironment
 from fuelweb_test.tests.base_test_case import TestBasic
-from fuelweb_test import logger
 
 
-@test(groups=["thread_1"])
+@test(enabled=False, groups=["thread_1"])
 class TestAdminNode(TestBasic):
-    """TestAdminNode."""  # TODO documentation
+    """TestAdminNode.
 
-    @test(depends_on=[SetupEnvironment.setup_master],
+    Test disabled and move to fuel_tests suite:
+        fuel_tests.test.test_admin_node
+    """  # TODO documentation
+
+    @test(enabled=False, depends_on=[SetupEnvironment.setup_master],
           groups=["test_cobbler_alive"])
     @log_snapshot_after_test
     def test_cobbler_alive(self):
         """Test current installation has correctly setup cobbler
+
+        Test disabled and move to fuel_tests suite:
+            fuel_tests.test.test_admin_node.TestAdminNode
 
         API and cobbler HTTP server are alive
 
@@ -50,29 +65,35 @@ class TestAdminNode(TestBasic):
         Duration 1m
 
         """
-        if OPENSTACK_RELEASE_CENTOS not in OPENSTACK_RELEASE:
-            raise SkipTest()
+        # pylint: disable=W0101
+        warn("Test disabled and move to fuel_tests suite", DeprecationWarning)
+        raise SkipTest("Test disabled and move to fuel_tests suite")
+
         self.env.revert_snapshot("empty")
         wait(
             lambda: http(host=self.env.get_admin_node_ip(), url='/cobbler_api',
                          waited_code=501),
-            timeout=60
+            timeout=60,
+            timeout_msg='Cobler WEB API is not alive'
         )
-        server = xmlrpclib.Server(
+        server = ServerProxy(
             'http://%s/cobbler_api' % self.env.get_admin_node_ip())
 
-        config = self.env.get_fuel_settings()
+        config = self.env.admin_actions.get_fuel_settings()
         username = config['cobbler']['user']
         password = config['cobbler']['password']
 
         # raises an error if something isn't right
         server.login(username, password)
 
-    @test(depends_on=[SetupEnvironment.setup_master],
+    @test(enabled=False, depends_on=[SetupEnvironment.setup_master],
           groups=["test_astuted_alive"])
     @log_snapshot_after_test
     def test_astuted_alive(self):
         """Test astute master and worker processes are alive on master node
+
+        Test disabled and move to fuel_tests suite:
+            fuel_tests.test.test_admin_node.TestAdminNode
 
         Scenario:
             1. Revert snapshot "empty"
@@ -81,116 +102,92 @@ class TestAdminNode(TestBasic):
         Duration 1m
 
         """
-        if OPENSTACK_RELEASE_CENTOS not in OPENSTACK_RELEASE:
-            raise SkipTest()
+        # pylint: disable=W0101
+        warn("Test disabled and move to fuel_tests suite", DeprecationWarning)
+        raise SkipTest("Test disabled and move to fuel_tests suite")
+
         self.env.revert_snapshot("empty")
-        ps_output = self.env.d_env.get_admin_remote().execute(
-            'ps ax')['stdout']
-        astute_master = filter(lambda x: 'astute master' in x, ps_output)
-        logger.info("Found astute processes: %s" % astute_master)
+        ps_output = self.ssh_manager.execute(
+            self.ssh_manager.admin_ip, 'ps ax')['stdout']
+        astute_master = [
+            master for master in ps_output if 'astute master' in master]
+        logger.info("Found astute processes: {:s}".format(astute_master))
         assert_equal(len(astute_master), 1)
-        astute_workers = filter(lambda x: 'astute worker' in x, ps_output)
+        astute_workers = [
+            worker for worker in ps_output if 'astute worker' in worker]
         logger.info(
-            "Found %d astute worker processes: %s" %
-            (len(astute_workers), astute_workers))
+            "Found {len:d} astute worker processes: {workers!s}"
+            "".format(len=len(astute_workers), workers=astute_workers))
         assert_equal(True, len(astute_workers) > 1)
-
-
-@test(groups=["known_issues"])
-class TestAdminNodeBackupRestore(TestBasic):
-    @test(depends_on=[SetupEnvironment.setup_master],
-          groups=["backup_restore_master_base"])
-    @log_snapshot_after_test
-    def backup_restore_master_base(self):
-        """Backup/restore master node
-
-        Scenario:
-            1. Revert snapshot "empty"
-            2. Backup master
-            3. Check backup
-            4. Restore master
-            5. Check restore
-
-        Duration 30m
-
-        """
-        self.env.revert_snapshot("empty")
-        self.fuel_web.backup_master(self.env.d_env.get_admin_remote())
-        checkers.backup_check(self.env.d_env.get_admin_remote())
-        self.fuel_web.restore_master(self.env.d_env.get_admin_remote())
-        self.fuel_web.restore_check_nailgun_api(
-            self.env.d_env.get_admin_remote())
-        checkers.restore_check_sum(self.env.d_env.get_admin_remote())
-        checkers.iptables_check(self.env.d_env.get_admin_remote())
 
 
 @test(groups=["logrotate"])
 class TestLogrotateBase(TestBasic):
+    @staticmethod
+    def no_error_in_log(log_txt):
+        checker = re.compile(r'\s+(error)[: \n\t]+', flags=re.IGNORECASE)
+        return len(checker.findall(log_txt)) == 0
 
-    def generate_file(self, remote, name, path, size):
+    def generate_file(self, remote_ip, name, path, size):
         cmd = 'cd {0} && fallocate -l {1} {2}'.format(path, size, name)
-        result = remote.execute(cmd)
-        assert_equal(0, result['exit_code'],
-                     'Command {0} execution failed. '
-                     'Execution result is: {1}'.format(cmd, result))
+        self.ssh_manager.execute_on_remote(remote_ip, cmd)
 
-    def execute_logrotate_cmd(self, remote, cmd=None, exit_code=None):
+    def execute_logrotate_cmd(
+            self, remote_ip, force=True, cmd=None, any_exit_code=False):
         if not cmd:
-            cmd = 'logrotate -v -f /etc/logrotate.conf'
-        result = remote.execute(cmd)
-        logger.debug(
-            'Results of command {0} execution exit_code:{1} '
-            'stdout: {2} stderr: {3}'.format(
-                cmd, result['exit_code'], result['stdout'], result['stderr']))
-        if not exit_code:
-            assert_equal(0, result['exit_code'],
-                         'Command {0} execution failed. '
-                         'Execution result is: {1}'.format(cmd, result))
-        else:
-            return result
+            cmd = 'logrotate -v {0} /etc/logrotate.conf'.format(
+                '-f' if force else "")
+        result = self.ssh_manager.execute_on_remote(
+            remote_ip, cmd, raise_on_assert=not any_exit_code)
 
-    def check_free_space(self, remote, return_as_is=None):
-        result = remote.execute(
+        assert_equal(
+            True, self.no_error_in_log(result['stderr_str']),
+            'logrotate failed with:\n{0}'.format(result['stderr_str']))
+        logger.info('Logrotate: success')
+        return result
+
+    def check_free_space(self, remote_ip, return_as_is=None):
+        result = self.ssh_manager.execute_on_remote(
+            remote_ip,
             'python -c "import os; '
             'stats=os.statvfs(\'/var/log\'); '
-            'print stats.f_bavail * stats.f_frsize"')
-        assert_equal(0, result['exit_code'],
-                     'Failed to check free '
-                     'space with {0}'. format(result))
+            'print stats.f_bavail * stats.f_frsize"',
+            err_msg='Failed to check free space!'
+        )
         if not return_as_is:
             return self.bytestogb(int(result['stdout'][0]))
         else:
             return int(result['stdout'][0])
 
-    def check_free_inodes(self, remote):
-        result = remote.execute(
+    def check_free_inodes(self, remote_ip):
+        result = self.ssh_manager.execute_on_remote(
+            remote_ip,
             'python -c "import os; '
             'stats=os.statvfs(\'/var/log\'); '
-            'print stats.f_ffree"')
-        assert_equal(0, result['exit_code'],
-                     'Failed to check free '
-                     'inodes with {0}'. format(result))
+            'print stats.f_ffree"',
+            err_msg='Failed to check free inodes!')
         return self.bytestogb(int(result['stdout'][0]))
 
-    def bytestogb(self, data):
+    @staticmethod
+    def bytestogb(data):
         symbols = ('K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y')
         prefix = {}
         for i, s in enumerate(symbols):
             prefix[s] = 1 << (i + 1) * 10
         for s in reversed(symbols):
             if data >= prefix[s]:
-                value = float(data) / prefix[s]
+                value = data / prefix[s]
                 return format(value, '.1f'), s
         return data, 'B'
 
-    def create_old_file(self, remote, name):
+    def create_old_file(self, remote_ip, name):
         one_week_old = datetime.datetime.now() - datetime.timedelta(days=7)
-        res = remote.execute(
-            'touch {0} -d {1}'.format(name, one_week_old))
-        assert_equal(0, res['exit_code'],
-                     'Failed to create old '
-                     'file with next result: {0}'.format(res))
-        return res
+        result = self.ssh_manager.execute_on_remote(
+            remote_ip,
+            'touch {0} -d {1}'.format(name, one_week_old),
+            err_msg='Failed to create old file!'
+        )
+        return result
 
     @test(depends_on=[SetupEnvironment.setup_master],
           groups=["test_logrotate"])
@@ -208,62 +205,63 @@ class TestLogrotateBase(TestBasic):
         Duration 30m
 
         """
+        self.show_step(1, initialize=True)
         self.env.revert_snapshot("empty")
-        with self.env.d_env.get_admin_remote() as remote:
 
-            # get data before logrotate
-            free, suff = self.check_free_space(remote)
+        admin_ip = self.ssh_manager.admin_ip
 
-            free_inodes, i_suff = self.check_free_inodes(remote)
-            logger.debug('Free inodes before file '
-                         'creation: {0}{1}'.format(free_inodes, i_suff))
+        # get data before logrotate
+        self.show_step(2)
+        free, suff = self.check_free_space(admin_ip)
 
-            self.generate_file(
-                remote, size='2G',
-                path='/var/log/',
-                name='messages')
+        free_inodes, i_suff = self.check_free_inodes(admin_ip)
+        logger.debug('Free inodes before file '
+                     'creation: {0}{1}'.format(free_inodes, i_suff))
+        self.show_step(3)
+        self.generate_file(
+            admin_ip, size='2G',
+            path='/var/log/',
+            name='messages')
 
-            free2, suff2 = self.check_free_space(remote)
-            assert_true(
-                free2 < free,
-                'File was not created. Free space '
-                'before creation {0}{1}, '
-                'free space after '
-                'creation {2}{3}'.format(free, suff, free2, suff2))
+        # Get free space after file creation
+        free2, suff2 = self.check_free_space(admin_ip)
+        assert_true(
+            free2 < free,
+            'File was not created. Free space '
+            'before creation {0}{1}, '
+            'free space after '
+            'creation {2}{3}'.format(free, suff, free2, suff2))
 
-            self.execute_logrotate_cmd(remote)
+        self.show_step(4)
+        self.execute_logrotate_cmd(admin_ip, force=False)
 
-            free3, suff3 = self.check_free_space(remote)
-            res = self.execute_logrotate_cmd(remote, exit_code=1)
+        free3, suff3 = self.check_free_space(admin_ip)
+        logger.debug('Free space after first '
+                     'rotation {0} {1}'.format(free3, suff3))
 
-            # Expect 1 exit code here, according
-            # to some rotated logs are skipped to rotate
-            # second run. That's caused 1
-            assert_equal(1, res['exit_code'])
-            assert_equal(
-                False, 'error' in res['stderr'],
-                'Second run of logrotate failed'
-                ' with {0}'.format(res['stderr']))
+        # Allow any exit code, but check real status later
+        # Logrotate can return fake-fail on second run
+        self.execute_logrotate_cmd(admin_ip, any_exit_code=True)
 
-            free4, suff4 = self.check_free_space(remote)
-            free_inodes4, i_suff4 = self.check_free_inodes(remote)
-            logger.info('Free inodes  after logrotation:'
-                        ' {0}{1}'.format(free_inodes4, i_suff4))
+        free4, suff4 = self.check_free_space(admin_ip)
+        free_inodes4, i_suff4 = self.check_free_inodes(admin_ip)
+        logger.info('Free inodes  after logrotation:'
+                    ' {0}{1}'.format(free_inodes4, i_suff4))
 
-            assert_true(
-                free4 > free3,
-                'Logs were not rotated. '
-                'Rotate was executed 2 times. '
-                'Free space after first rotation: {0}{1}, '
-                'after second {2}{3} free space before rotation {4}'
-                '{5}'.format(free3, suff3, free4, suff4, free, suff))
+        assert_true(
+            free4 > free2,
+            'Logs were not rotated. '
+            'Rotate was executed 2 times. '
+            'Free space after file creation: {0}{1}, '
+            'after rotation {2}{3} free space before rotation {4}'
+            '{5}'.format(free2, suff2, free4, suff4, free, suff))
 
-            assert_equal(
-                (free_inodes, i_suff),
-                (free_inodes4, i_suff4),
-                'Unexpected  free inodes count. Before log rotate was: {0}{1}'
-                ' after logrotation: {2}{3}'.format(
-                    free_inodes, i_suff, free_inodes4, i_suff4))
+        assert_equal(
+            (free_inodes, i_suff),
+            (free_inodes4, i_suff4),
+            'Unexpected  free inodes count. Before log rotate was: {0}{1}'
+            ' after logrotation: {2}{3}'.format(
+                free_inodes, i_suff, free_inodes4, i_suff4))
         self.env.make_snapshot("test_logrotate")
 
     @test(depends_on=[SetupEnvironment.setup_master],
@@ -282,54 +280,57 @@ class TestLogrotateBase(TestBasic):
         Duration 30m
 
         """
+        self.show_step(1, initialize=True)
         self.env.revert_snapshot("empty")
-        with self.env.d_env.get_admin_remote() as remote:
 
-            # get data before logrotate
-            free, suff = self.check_free_space(remote)
-            free_inodes, i_suff = self.check_free_inodes(remote)
-            logger.debug('Free inodes before file '
-                         'creation: {0}{1}'.format(free_inodes, i_suff))
+        admin_ip = self.ssh_manager.admin_ip
 
-            self.generate_file(
-                remote, size='2G',
-                path='/var/log/',
-                name='ostf-test.log')
+        # get data before logrotate
+        self.show_step(2)
+        free, suff = self.check_free_space(admin_ip)
+        free_inodes, i_suff = self.check_free_inodes(admin_ip)
+        logger.debug('Free inodes before file '
+                     'creation: {0}{1}'.format(free_inodes, i_suff))
+        self.show_step(3)
+        self.generate_file(
+            admin_ip, size='2G',
+            path='/var/log/',
+            name='ostf-test.log')
 
-            free2, suff2 = self.check_free_space(remote)
-            assert_true(
-                free2 < free,
-                'File was not created. Free space '
-                'before creation {0}{1}, '
-                'free space after '
-                'creation {2}{3}'.format(free, suff, free2, suff2))
+        free2, suff2 = self.check_free_space(admin_ip)
+        assert_true(
+            free2 < free,
+            'File was not created. Free space '
+            'before creation {0}{1}, '
+            'free space after '
+            'creation {2}{3}'.format(free, suff, free2, suff2))
+        self.show_step(4)
+        self.execute_logrotate_cmd(admin_ip, cmd='/usr/bin/fuel-logrotate')
+        self.show_step(5)
+        free3, suff3 = self.check_free_space(admin_ip)
+        free_inodes3, i_suff3 = self.check_free_inodes(admin_ip)
+        logger.info('Free inodes  after logrotation:'
+                    ' {0}{1}'.format(free_inodes3, i_suff3))
 
-            self.execute_logrotate_cmd(remote, cmd='/usr/bin/fuel-logrotate')
+        assert_true(
+            free3 > free2,
+            'Logs were not rotated. '
+            'Free space before rotation: {0}{1}, '
+            'after rotation {2}{3}'.format(free2, suff2, free3, suff3))
 
-            free3, suff3 = self.check_free_space(remote)
-            free_inodes3, i_suff3 = self.check_free_inodes(remote)
-            logger.info('Free inodes  after logrotation:'
-                        ' {0}{1}'.format(free_inodes3, i_suff3))
-
-            assert_true(
-                free3 > free2,
-                'Logs were not rotated. '
-                'Free space before rotation: {0}{1}, '
-                'after rotation {2}{3}'.format(free2, suff2, free3, suff3))
-
-            assert_equal(
-                (free_inodes, i_suff),
-                (free_inodes3, i_suff3),
-                'Unexpected  free inodes count. Before log rotate was: {0}{1}'
-                ' after logrotation: {2}{3}'.format(
-                    free_inodes, i_suff, free_inodes3, i_suff3))
+        assert_equal(
+            (free_inodes, i_suff),
+            (free_inodes3, i_suff3),
+            'Unexpected  free inodes count. Before log rotate was: {0}{1}'
+            ' after logrotation: {2}{3}'.format(
+                free_inodes, i_suff, free_inodes3, i_suff3))
 
         self.env.make_snapshot("test_fuel_nondaily_logrotate")
 
     @test(depends_on=[SetupEnvironment.setup_master],
           groups=["test_logrotate_101MB"])
     @log_snapshot_after_test
-    def test_log_rotation_101MB(self):
+    def test_log_rotation_101mb(self):
         """Logrotate with logrotate.conf for 101MB size file on master node
 
         Scenario:
@@ -342,68 +343,67 @@ class TestLogrotateBase(TestBasic):
         Duration 30m
 
         """
+        self.show_step(1, initialize=True)
         self.env.revert_snapshot("empty")
-        with self.env.d_env.get_admin_remote() as remote:
 
-            # get data before logrotate
-            free, suff = self.check_free_space(remote)
+        admin_ip = self.ssh_manager.admin_ip
 
-            free_inodes, i_suff = self.check_free_inodes(remote)
-            logger.debug('Free inodes before file '
-                         'creation: {0}{1}'.format(free_inodes, i_suff))
+        # get data before logrotate
+        self.show_step(2)
+        free, suff = self.check_free_space(admin_ip)
 
-            self.generate_file(
-                remote, size='101M',
-                path='/var/log/',
-                name='messages')
+        free_inodes, i_suff = self.check_free_inodes(admin_ip)
+        logger.debug('Free inodes before file '
+                     'creation: {0}{1}'.format(free_inodes, i_suff))
+        self.show_step(3)
+        self.generate_file(
+            admin_ip, size='101M',
+            path='/var/log/',
+            name='messages')
 
-            free2, suff2 = self.check_free_space(remote)
-            assert_true(
-                free2 < free,
-                'File was not created. Free space '
-                'before creation {0}{1}, '
-                'free space after '
-                'creation {2}{3}'.format(free, suff, free2, suff2))
+        free2, suff2 = self.check_free_space(admin_ip)
+        assert_true(
+            free2 < free,
+            'File was not created. Free space '
+            'before creation {0}{1}, '
+            'free space after '
+            'creation {2}{3}'.format(free, suff, free2, suff2))
+        self.show_step(4)
+        self.execute_logrotate_cmd(admin_ip, force=False)
 
-            self.execute_logrotate_cmd(remote)
+        free3, suff3 = self.check_free_space(admin_ip)
+        logger.debug('free space after first '
+                     'rotation: {0}{1}'.format(free3, suff3))
 
-            free3, suff3 = self.check_free_space(remote)
-            res = self.execute_logrotate_cmd(remote, exit_code=1)
+        # Allow any exit code, but check real status later
+        # Logrotate can return fake-fail on second run
+        self.execute_logrotate_cmd(admin_ip, any_exit_code=True)
 
-            # Expect 1 exit code here, according
-            # to some rotated logs are skipped to rotate
-            # second run. That's caused 1
-            assert_equal(1, res['exit_code'])
-            assert_equal(
-                False, 'error' in res['stderr'],
-                'Second run of logrotate failed'
-                ' with {0}'.format(res['stderr']))
+        free4, suff4 = self.check_free_space(admin_ip)
+        free_inodes4, i_suff4 = self.check_free_inodes(admin_ip)
+        logger.info('Free inodes  after logrotation:'
+                    ' {0}{1}'.format(free_inodes4, i_suff4))
 
-            free4, suff4 = self.check_free_space(remote)
-            free_inodes4, i_suff4 = self.check_free_inodes(remote)
-            logger.info('Free inodes  after logrotation:'
-                        ' {0}{1}'.format(free_inodes4, i_suff4))
+        assert_true(
+            free4 > free2,
+            'Logs were not rotated. '
+            'Rotate was executed 2 times. '
+            'Free space after file creation: {0}{1}, '
+            'after rotation {2}{3} free space before rotation {4}'
+            '{5}'.format(free2, suff2, free4, suff4, free, suff))
 
-            assert_true(
-                free4 > free3,
-                'Logs were not rotated. '
-                'Rotate was executed 2 times. '
-                'Free space after first rotation: {0}{1}, '
-                'after second {2}{3} free space before rotation {4}'
-                '{5}'.format(free3, suff3, free4, suff4, free, suff))
-
-            assert_equal(
-                (free_inodes, i_suff),
-                (free_inodes4, i_suff4),
-                'Unexpected  free inodes count. Before log rotate was: {0}{1}'
-                ' after logrotation: {2}{3}'.format(
-                    free_inodes, i_suff, free_inodes4, i_suff4))
+        assert_equal(
+            (free_inodes, i_suff),
+            (free_inodes4, i_suff4),
+            'Unexpected  free inodes count. Before log rotate was: {0}{1}'
+            ' after logrotation: {2}{3}'.format(
+                free_inodes, i_suff, free_inodes4, i_suff4))
         self.env.make_snapshot("test_logrotate_101MB")
 
     @test(depends_on=[SetupEnvironment.setup_master],
           groups=["test_logrotate_one_week_11MB"])
     @log_snapshot_after_test
-    def test_log_rotation_one_week_11MB(self):
+    def test_log_rotation_one_week_11mb(self):
         """Logrotate with logrotate.conf for 1 week old file with size 11MB
 
         Scenario:
@@ -416,63 +416,184 @@ class TestLogrotateBase(TestBasic):
         Duration 30m
 
         """
+        self.show_step(1, initialize=True)
         self.env.revert_snapshot("empty")
-        with self.env.d_env.get_admin_remote() as remote:
 
-            # get data before logrotate
-            free = self.check_free_space(remote, return_as_is=True)
+        admin_ip = self.ssh_manager.admin_ip
 
-            free_inodes, i_suff = self.check_free_inodes(remote)
-            logger.debug('Free inodes before file '
-                         'creation: {0}{1}'.format(free_inodes, i_suff))
-            # create 1 week old emty file
+        # get data before logrotate
+        self.show_step(2)
+        free = self.check_free_space(admin_ip, return_as_is=True)
 
-            self.create_old_file(remote, name='/var/log/messages')
+        free_inodes, i_suff = self.check_free_inodes(admin_ip)
+        logger.debug('Free inodes before file '
+                     'creation: {0}{1}'.format(free_inodes, i_suff))
+        # create 1 week old empty file
 
-            self.generate_file(
-                remote, size='11M',
-                path='/var/log/',
-                name='messages')
+        self.create_old_file(admin_ip, name='/var/log/messages')
+        self.show_step(3)
+        self.generate_file(
+            admin_ip, size='11M',
+            path='/var/log/',
+            name='messages')
 
-            free2 = self.check_free_space(remote, return_as_is=True)
-            assert_true(
-                free2 < free,
-                'File was not created. Free space '
-                'before creation {0}, '
-                'free space after '
-                'creation {1}'.format(free, free2))
+        free2 = self.check_free_space(admin_ip, return_as_is=True)
+        assert_true(
+            free2 < free,
+            'File was not created. Free space '
+            'before creation {0}, '
+            'free space after '
+            'creation {1}'.format(free, free2))
+        self.show_step(4)
+        self.execute_logrotate_cmd(admin_ip)
 
-            self.execute_logrotate_cmd(remote)
+        free3 = self.check_free_space(admin_ip, return_as_is=True)
+        logger.debug('Free space after first'
+                     ' rotation {0}'.format(free3))
 
-            free3 = self.check_free_space(remote, return_as_is=True)
-            res = self.execute_logrotate_cmd(remote, exit_code=1)
+        # Allow any exit code, but check real status later
+        # Logrotate can return fake-fail on second run
+        self.execute_logrotate_cmd(admin_ip, any_exit_code=True)
 
-            # Expect 1 exit code here, according
-            # to some rotated logs are skipped to rotate
-            # second run. That's caused 1
-            assert_equal(1, res['exit_code'])
-            assert_equal(
-                False, 'error' in res['stderr'],
-                'Second run of logrotate failed'
-                ' with {0}'.format(res['stderr']))
+        self.show_step(5)
+        free4 = self.check_free_space(admin_ip, return_as_is=True)
+        free_inodes4, i_suff4 = self.check_free_inodes(admin_ip)
+        logger.info('Free inodes  after logrotation:'
+                    ' {0}{1}'.format(free_inodes4, i_suff4))
 
-            free4 = self.check_free_space(remote, return_as_is=True)
-            free_inodes4, i_suff4 = self.check_free_inodes(remote)
-            logger.info('Free inodes  after logrotation:'
-                        ' {0}{1}'.format(free_inodes4, i_suff4))
+        assert_true(
+            free4 > free2,
+            'Logs were not rotated. '
+            'Rotate was executed 2 times. '
+            'Free space after file creation: {0}, '
+            'after rotation {1} free space before rotation'
+            '{2}'.format(free2, free4, free))
 
-            assert_true(
-                free4 > free3,
-                'Logs were not rotated. '
-                'Rotate was executed 2 times. '
-                'Free space after first rotation: {0}, '
-                'after second {1} free space before rotation'
-                '{2}'.format(free3, free4, free))
-
-            assert_equal(
-                (free_inodes, i_suff),
-                (free_inodes4, i_suff4),
-                'Unexpected  free inodes count. Before log rotate was: {0}{1}'
-                ' after logrotation: {2}{3}'.format(
-                    free_inodes, i_suff, free_inodes4, i_suff4))
+        assert_equal(
+            (free_inodes, i_suff),
+            (free_inodes4, i_suff4),
+            'Unexpected  free inodes count. Before log rotate was: {0}{1}'
+            ' after logrotation: {2}{3}'.format(
+                free_inodes, i_suff, free_inodes4, i_suff4))
         self.env.make_snapshot("test_logrotate_one_week_11MB")
+
+
+@test(groups=["tests_gpg_singing_check"])
+class GPGSigningCheck(TestBasic):
+    """ Tests for checking GPG signing """
+    def __init__(self):
+        super(GPGSigningCheck, self).__init__()
+        self.release_version = self.fuel_web.client.get_api_version().get(
+            'release')
+        self.gpg_name = settings.GPG_CENTOS_KEY_PATH.split('/')[-1].format(
+            release_version=self.release_version)
+        self.gpg_centos_key_path = settings.GPG_CENTOS_KEY_PATH.format(
+            release_version=self.release_version)
+        self.centos_repo_path = settings.CENTOS_REPO_PATH.format(
+            release_version=self.release_version)
+        self.ubuntu_repo_path = settings.UBUNTU_REPO_PATH.format(
+            release_version=self.release_version)
+        self.gpg_centos_key_path = settings.GPG_CENTOS_KEY_PATH.format(
+            release_version=self.release_version)
+
+    @test(depends_on=[SetupEnvironment.setup_master],
+          groups=['test_check_rpm_packages_signed'])
+    @log_snapshot_after_test
+    def check_rpm_packages_signed(self):
+        """Check that local rpm packages are signed
+
+        Scenario:
+            1. Create environment using fuel-qa
+            2. Import public GPG key for rpm verification by executing:
+               rpm --import gpg-pub-key
+            3. Check all local rpm packets and verify it
+
+        Duration: 15 min
+        """
+
+        self.show_step(1)
+        self.env.revert_snapshot('empty')
+
+        path_to_repos = '/var/www/nailgun/mos-centos/x86_64/Packages/'
+
+        self.show_step(2)
+        cmds = [
+            'wget {link}'.format(link=self.gpg_centos_key_path),
+            'rpm --import {gpg_pub_key}'.format(gpg_pub_key=self.gpg_name)
+        ]
+        for cmd in cmds:
+            self.ssh_manager.execute_on_remote(
+                ip=self.ssh_manager.admin_ip,
+                cmd=cmd
+            )
+
+        self.show_step(3)
+        self.ssh_manager.execute_on_remote(
+            ip=self.ssh_manager.admin_ip,
+            cmd='rpm -K {repos}*rpm'.format(repos=path_to_repos)
+        )
+
+    @test(depends_on=[SetupEnvironment.setup_master],
+          groups=['test_remote_packages_and_mos_repositories_signed'])
+    @log_snapshot_after_test
+    def check_remote_packages_and_mos_repositories_signed(self):
+        """Check that remote packages and MOS repositories are signed
+
+        Scenario:
+            1. Create environment using fuel-qa
+            2. Import GPG key for rpm
+            3. Import GPG key for gpg
+            4. Download repomd.xml.asc and repomd.xml and verify them
+            5. Download Release and Releasee.gpg and verify those
+            6. Download randomly chosen .rpm file and verify it
+
+        Duration: 15 min
+        """
+        self.show_step(1)
+        self.env.revert_snapshot('empty')
+
+        self.show_step(2)
+        self.show_step(3)
+        self.show_step(4)
+        self.show_step(5)
+        cmds = [
+            'wget {link}'.format(link=self.gpg_centos_key_path),
+            'rpm --import {gpg_pub_key}'.format(gpg_pub_key=self.gpg_name),
+            'gpg --import {gpg_pub_key}'.format(gpg_pub_key=self.gpg_name),
+            'wget {repo_path}os/x86_64/repodata/repomd.xml.asc'.format(
+                repo_path=self.centos_repo_path),
+            'wget {repo_path}os/x86_64/repodata/repomd.xml'.format(
+                repo_path=self.centos_repo_path),
+            'gpg --verify repomd.xml.asc repomd.xml',
+            'wget {repo_path}dists/mos{release_version}/Release'.format(
+                repo_path=self.ubuntu_repo_path,
+                release_version=self.release_version),
+            'wget {repo_path}dists/mos{release_version}/Release.gpg'.format(
+                repo_path=self.ubuntu_repo_path,
+                release_version=self.release_version),
+            'gpg --verify Release.gpg Release'
+        ]
+        for cmd in cmds:
+            self.ssh_manager.execute_on_remote(
+                ip=self.ssh_manager.admin_ip,
+                cmd=cmd
+            )
+
+        self.show_step(6)
+        response = urlopen(
+            '{}/os/x86_64/Packages/'.format(self.centos_repo_path)
+        )
+        source = response.read()
+        rpms = re.findall(r'href="(.*.rpm)"', source)
+        rpm = random.choice(rpms)
+
+        self.ssh_manager.execute_on_remote(
+            ip=self.ssh_manager.admin_ip,
+            cmd='wget {}os/x86_64/Packages/{}'.format(
+                self.centos_repo_path,
+                rpm)
+        )
+        self.ssh_manager.execute_on_remote(
+            ip=self.ssh_manager.admin_ip,
+            cmd='rpm -K {}'.format(rpm)
+        )

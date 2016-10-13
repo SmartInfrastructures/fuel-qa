@@ -1,0 +1,10 @@
+---
+- roles:
+    - controller
+    - mongo
+  count: 3
+- roles:
+    - compute
+    - ceph-osd
+  count: 3
+

@@ -16,7 +16,7 @@ import select
 import socket
 import threading
 
-from fuelweb_test import logwrap
+from core.helpers.log_helpers import logwrap
 
 
 class LogServer(threading.Thread):
@@ -64,9 +64,9 @@ class LogServer(threading.Thread):
     @logwrap
     def run(self):
         while self.started():
-            r, w, e = select.select(self.rlist, [], [], 1)
+            r, _, _ = select.select(self.rlist, [], [], 1)
             if self.socket in r:
-                message, addr = self.socket.recvfrom(2048)
+                message, _ = self.socket.recvfrom(2048)
                 self._handler(message)
 
 

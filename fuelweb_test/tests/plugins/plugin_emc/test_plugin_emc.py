@@ -11,16 +11,20 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-import ConfigParser
-import cStringIO
 import os
 
 from proboscis import asserts
 from proboscis import test
+# pylint: disable=import-error
+# noinspection PyUnresolvedReferences
+from six.moves import configparser
+# pylint: enable=import-error
 
-from fuelweb_test.helpers import checkers
+from fuelweb_test.helpers import utils
+from fuelweb_test.helpers.checkers import check_plugin_path_env
+from fuelweb_test.helpers.ssh_manager import SSHManager
 from fuelweb_test.helpers.decorators import log_snapshot_after_test
-from fuelweb_test import settings as CONF
+from fuelweb_test import settings
 from fuelweb_test.tests.base_test_case import SetupEnvironment
 from fuelweb_test.tests.base_test_case import TestBasic
 
@@ -28,14 +32,21 @@ from fuelweb_test.tests.base_test_case import TestBasic
 @test(groups=["plugins"])
 class EMCPlugin(TestBasic):
     """EMCPlugin."""  # TODO documentation
+    def __init__(self):
+        super(EMCPlugin, self).__init__()
+        check_plugin_path_env(
+            var_name='EMC_PLUGIN_PATH',
+            plugin_path=settings.EMC_PLUGIN_PATH
+        )
 
     @classmethod
-    def check_emc_cinder_config(cls, remote, path):
-        command = 'cat {0}'.format(path)
-        conf_data = ''.join(remote.execute(command)['stdout'])
-        conf_data = cStringIO.StringIO(conf_data)
-        cinder_conf = ConfigParser.ConfigParser()
-        cinder_conf.readfp(conf_data)
+    def check_emc_cinder_config(cls, ip, path):
+        with SSHManager().open_on_remote(
+            ip=ip,
+            path=path
+        ) as f:
+            cinder_conf = configparser.ConfigParser()
+            cinder_conf.readfp(f)
 
         asserts.assert_equal(
             cinder_conf.get('DEFAULT', 'volume_driver'),
@@ -71,16 +82,16 @@ class EMCPlugin(TestBasic):
         return service in ps_output
 
     @classmethod
-    def check_emc_management_package(cls, remote):
-        navicli = checkers.get_package_versions_from_node(
-            remote=remote,
+    def check_emc_management_package(cls, ip):
+        navicli = utils.get_package_versions_from_node(
+            ip=ip,
             name='navicli',
-            os_type=CONF.OPENSTACK_RELEASE)
-        naviseccli = checkers.get_package_versions_from_node(
-            remote=remote,
+            os_type=settings.OPENSTACK_RELEASE)
+        naviseccli = utils.get_package_versions_from_node(
+            ip=ip,
             name='naviseccli',
-            os_type=CONF.OPENSTACK_RELEASE)
-        return any([out != '' for out in navicli, naviseccli])
+            os_type=settings.OPENSTACK_RELEASE)
+        return bool(navicli + naviseccli)
 
     @test(depends_on=[SetupEnvironment.prepare_slaves_5],
           groups=["deploy_emc_ha"])
@@ -105,29 +116,20 @@ class EMCPlugin(TestBasic):
         self.env.revert_snapshot("ready_with_5_slaves")
 
         # copy plugin to the master node
-
-        checkers.upload_tarball(
-            self.env.d_env.get_admin_remote(),
-            CONF.EMC_PLUGIN_PATH, '/var')
+        utils.upload_tarball(
+            ip=self.ssh_manager.admin_ip,
+            tar_path=settings.EMC_PLUGIN_PATH,
+            tar_target='/var'
+        )
 
         # install plugin
-
-        checkers.install_plugin_check_code(
-            self.env.d_env.get_admin_remote(),
-            plugin=os.path.basename(CONF.EMC_PLUGIN_PATH))
-
-        settings = None
-
-        if CONF.NEUTRON_ENABLE:
-            settings = {
-                "net_provider": 'neutron',
-                "net_segment_type": CONF.NEUTRON_SEGMENT_TYPE
-            }
+        utils.install_plugin_check_code(
+            ip=self.ssh_manager.admin_ip,
+            plugin=os.path.basename(settings.EMC_PLUGIN_PATH))
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
-            mode=CONF.DEPLOYMENT_MODE,
-            settings=settings
+            mode=settings.DEPLOYMENT_MODE,
         )
 
         attr = self.fuel_web.client.get_cluster_attributes(cluster_id)
@@ -149,11 +151,11 @@ class EMCPlugin(TestBasic):
 
         emc_options = attr["editable"]["emc_vnx"]
         emc_options["metadata"]["enabled"] = True
-        emc_options["emc_sp_a_ip"]["value"] = CONF.EMC_SP_A_IP
-        emc_options["emc_sp_b_ip"]["value"] = CONF.EMC_SP_B_IP
-        emc_options["emc_username"]["value"] = CONF.EMC_USERNAME
-        emc_options["emc_password"]["value"] = CONF.EMC_PASSWORD
-        emc_options["emc_pool_name"]["value"] = CONF.EMC_POOL_NAME
+        emc_options["emc_sp_a_ip"]["value"] = settings.EMC_SP_A_IP
+        emc_options["emc_sp_b_ip"]["value"] = settings.EMC_SP_B_IP
+        emc_options["emc_username"]["value"] = settings.EMC_USERNAME
+        emc_options["emc_password"]["value"] = settings.EMC_PASSWORD
+        emc_options["emc_pool_name"]["value"] = settings.EMC_POOL_NAME
 
         self.fuel_web.client.update_cluster_attributes(cluster_id, attr)
 
@@ -183,10 +185,10 @@ class EMCPlugin(TestBasic):
 
         # check cinder-volume settings
 
-        for remote in controller_remotes:
+        for node in controller_nodes:
             self.check_emc_cinder_config(
-                remote=remote, path='/etc/cinder/cinder.conf')
-            self.check_emc_management_package(remote=remote)
+                ip=node['ip'], path='/etc/cinder/cinder.conf')
+            self.check_emc_management_package(ip=node['ip'])
 
         # check cinder-volume layout on controllers
 
@@ -200,6 +202,12 @@ class EMCPlugin(TestBasic):
 
         cinder_volume_comps = [self.check_service(compute, "cinder-volume")
                                for compute in compute_remotes]
+        # closing connections
+        for remote in controller_remotes:
+            remote.clear()
+        for remote in compute_remotes:
+            remote.clear()
+
         asserts.assert_equal(sum(cinder_volume_comps), 0,
                              "Cluster has active cinder-volume on compute")
 

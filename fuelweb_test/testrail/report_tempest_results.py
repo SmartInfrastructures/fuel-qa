@@ -14,18 +14,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from __future__ import unicode_literals
+
 import optparse
-import time
-import urlparse
 from xml.etree import ElementTree
 
-import joblib
+# pylint: disable=import-error
+# noinspection PyUnresolvedReferences
+from six.moves import urllib
+# pylint: enable=import-error
 
-import report
-from settings import JENKINS
-from settings import logger
-from settings import TestRailSettings
-from testrail_client import TestRailProject
+from fuelweb_test.testrail import report
+from fuelweb_test.testrail.settings import JENKINS
+from fuelweb_test.testrail.settings import logger
+from fuelweb_test.testrail.settings import TestRailSettings
+from fuelweb_test.testrail.testrail_client import TestRailProject
 
 
 LOG = logger
@@ -58,17 +61,36 @@ def parse_xml_report(path_to_report):
     return test_results
 
 
-def mark_all_tests_as_failed(client, tests_suite):
-    """This function marks all Tempest tests as failed and returns the list
+def mark_all_tests_as_blocked(client, tests_suite):
+    """This function marks all Tempest tests as blocked and returns the list
     with TestResult objects. Each TestResult object corresponds to one of
-    the tests and contains the information that the test failed.
+    the tests and contains the information that the test is blocked.
     """
 
     test_results = []
     for case in client.get_cases(tests_suite['id']):
         test_result = report.TestResult(name=case['title'],
                                         group=case['custom_test_group'],
-                                        status='failed',
+                                        status='blocked',
+                                        description=None,
+                                        duration=1)
+        test_results.append(test_result)
+
+    return test_results
+
+
+def mark_all_tests_as_in_progress(client, tests_suite):
+    """This function marks all Tempest tests as "in progress" and returns
+    the list with TestResult objects. Each TestResult object corresponds
+    to one of the tests and contains the information that the test is
+    "in progress" status.
+    """
+
+    test_results = []
+    for case in client.get_cases(tests_suite['id']):
+        test_result = report.TestResult(name=case['title'],
+                                        group=case['custom_test_group'],
+                                        status='in_progress',
                                         description=None,
                                         duration=1)
         test_results.append(test_result)
@@ -97,21 +119,36 @@ def find_run_by_config_in_test_plan_entry(test_plan_entry, config):
             return run
 
 
-def upload_test_result(client, test_run, test_result):
-    """This function uploads the test result (parameter "test_result" contains
-    all the test result information) to TestRail for the specified test run.
+def upload_test_results(client, test_run, suite_id, test_results):
+    """ This function allows to upload large number of test results
+        with the minimum number of APi requests to TestRail.
     """
 
-    if 'setUpClass' in test_result.name:
-        i = test_result.name.find('tempest')
-        group = test_result.name[i:-1]
-        for t in client.get_tests_by_group(test_run['id'], group):
-            client.add_results_for_test(t['id'], test_result)
-    else:
-        test = client.get_test_by_name_and_group(
-            test_run['id'], test_result.name, test_result.group)
-        if test:
-            client.add_results_for_test(test['id'], test_result)
+    test_cases = client.get_cases(suite_id)
+    results = []
+    statuses = {}
+
+    for test_result in test_results:
+        if test_result.status in statuses:
+            status_id = statuses[test_result.status]
+        else:
+            status_id = client.get_status(test_result.status)['id']
+            statuses[test_result.status] = status_id
+
+        if 'setUpClass' in test_result.name:
+            i = test_result.name.find('tempest')
+            group = test_result.name[i:-1]
+            for test in test_cases:
+                if group in test.get("custom_test_group"):
+                    results.append({"case_id": test['id'],
+                                    "status_id": status_id})
+        else:
+            for test in test_cases:
+                if test_result.name in test.get("title"):
+                    results.append({"case_id": test['id'],
+                                    "status_id": status_id})
+
+    client.add_results_for_tempest_cases(test_run['id'], results)
 
 
 def main():
@@ -124,23 +161,29 @@ def main():
     parser.add_option('-i', '--iso', dest='iso_number', help='ISO number')
     parser.add_option('-p', '--path-to-report', dest='path',
                       help='The path to the Tempest XML report')
-    parser.add_option('-c', '--conf', dest='config', default='Centos 6.5',
+    parser.add_option('-c', '--conf', dest='config', default='Ubuntu 14.04',
                       help='The name of one of the configurations')
     parser.add_option('-m', '--multithreading', dest='threads_count',
                       default=100, help='The count of threads '
                                         'for uploading the test results')
-    parser.add_option('-f', '--fail-all-tests', dest='all_tests_failed',
-                      action='store_true', help='Mark all Tempest tests as '
-                                                'failed regardless of genuine '
-                                                'results')
+    parser.add_option('-b', '--block-all-tests',
+                      dest='all_tests_blocked', action='store_true',
+                      help='Mark all Tempest tests as "blocked"')
+    parser.add_option('-t', '--tests-in-progress',
+                      dest='tests_in_progress', action='store_true',
+                      help='Mark all Tempest tests as "in progress"')
+    parser.add_option('--prefix',
+                      dest='prefix', action='store_true', default='',
+                      help='Add some prefix to test run')
 
-    (options, args) = parser.parse_args()
+    (options, _) = parser.parse_args()
 
     if options.run_name is None:
         raise optparse.OptionValueError('No run name was specified!')
     if options.iso_number is None:
         raise optparse.OptionValueError('No ISO number was specified!')
-    if options.path is None and not options.all_tests_failed:
+    if (options.path is None and
+            not options.all_tests_blocked and not options.tests_in_progress):
         raise optparse.OptionValueError('No path to the Tempest '
                                         'XML report was specified!')
 
@@ -158,8 +201,10 @@ def main():
 
     # STEP #2
     # Parse the test results
-    if options.all_tests_failed:
-        test_results = mark_all_tests_as_failed(client, tests_suite)
+    if options.all_tests_blocked:
+        test_results = mark_all_tests_as_blocked(client, tests_suite)
+    elif options.tests_in_progress:
+        test_results = mark_all_tests_as_in_progress(client, tests_suite)
     else:
         LOG.info('Parsing the test results...')
         test_results = parse_xml_report(options.path)
@@ -167,9 +212,13 @@ def main():
 
     # STEP #3
     # Create new test plan (or find existing)
+    name = '{0} {1}iso #{2}'
+    if options.prefix is not '':
+        options.prefix += ' '
+
     milestone = client.get_milestone_by_name(TestRailSettings.milestone)
-    test_plan_name = '{0} iso #{1}'.format(milestone['name'],
-                                           options.iso_number)
+    test_plan_name = name.format(milestone['name'], options.prefix,
+                                 options.iso_number)
     LOG.info('Test plan name is "{0}".'.format(test_plan_name))
 
     LOG.info('Trying to find test plan "{0}"...'.format(test_plan_name))
@@ -177,7 +226,7 @@ def main():
     if not test_plan:
         LOG.info('The test plan not found. Creating one...')
         url = '/job/{0}.all/{1}'.format(milestone['name'], options.iso_number)
-        description = urlparse.urljoin(JENKINS['url'], url)
+        description = urllib.parse.urljoin(JENKINS['url'], url)
         test_plan = client.add_plan(test_plan_name,
                                     description=description,
                                     milestone_id=milestone['id'],
@@ -222,26 +271,11 @@ def main():
     # STEP #4
     # Upload the test results to TestRail for the specified test run
     LOG.info('Uploading the test results to TestRail...')
-    tries_count = 10
-    threads_count = options.threads_count
-    while tries_count > 0:
-        try:
-            joblib.Parallel(n_jobs=threads_count)(joblib.delayed(
-                upload_test_result)(client, run, r) for r in test_results)
-            break
-        except Exception as e:
-            tries_count -= 1
-            threads_count = int(threads_count * 3 / 4)
 
-            msg = 'Can not upload Tempest results to TestRail, error: {0}'
-            LOG.info(msg.format(e))
-
-            # wait while TestRail will be ready for new iteration
-            time.sleep(10)
+    upload_test_results(client, run, tests_suite['id'], test_results)
 
     LOG.info('The results of Tempest tests have been uploaded.')
     LOG.info('Report URL: {0}'.format(test_plan['url']))
-
 
 if __name__ == "__main__":
     main()

@@ -16,11 +16,11 @@ from proboscis.asserts import assert_equal
 
 from fuelweb_test import logger
 from fuelweb_test.helpers.utils import check_distribution
-from fuelweb_test.helpers.utils import run_on_remote
 from fuelweb_test.settings import DNS_SUFFIX
 from fuelweb_test.settings import OPENSTACK_RELEASE
 from fuelweb_test.settings import OPENSTACK_RELEASE_CENTOS
 from fuelweb_test.settings import OPENSTACK_RELEASE_UBUNTU
+from fuelweb_test.settings import UBUNTU_SERVICE_PROVIDER
 
 
 def start_monitor(remote):
@@ -32,10 +32,10 @@ def start_monitor(remote):
     """
     logger.debug("Starting Ceph monitor on {0}".format(remote.host))
     check_distribution()
-    if OPENSTACK_RELEASE == OPENSTACK_RELEASE_UBUNTU:
-        run_on_remote(remote, 'start ceph-mon-all')
-    if OPENSTACK_RELEASE == OPENSTACK_RELEASE_CENTOS:
-        run_on_remote(remote, '/etc/init.d/ceph start')
+    if OPENSTACK_RELEASE_UBUNTU in OPENSTACK_RELEASE:
+        remote.check_call('start ceph-mon-all')
+    if OPENSTACK_RELEASE_CENTOS in OPENSTACK_RELEASE:
+        remote.check_call('/etc/init.d/ceph start')
 
 
 def stop_monitor(remote):
@@ -47,10 +47,10 @@ def stop_monitor(remote):
     """
     logger.debug("Stopping Ceph monitor on {0}".format(remote.host))
     check_distribution()
-    if OPENSTACK_RELEASE == OPENSTACK_RELEASE_UBUNTU:
-        run_on_remote(remote, 'stop ceph-mon-all')
-    if OPENSTACK_RELEASE == OPENSTACK_RELEASE_CENTOS:
-        run_on_remote(remote, '/etc/init.d/ceph stop')
+    if OPENSTACK_RELEASE_UBUNTU in OPENSTACK_RELEASE:
+        remote.check_call('stop ceph-mon-all')
+    if OPENSTACK_RELEASE_CENTOS in OPENSTACK_RELEASE:
+        remote.check_call('/etc/init.d/ceph stop')
 
 
 def restart_monitor(remote):
@@ -67,7 +67,7 @@ def restart_monitor(remote):
 def get_health(remote):
     logger.debug("Checking Ceph cluster health on {0}".format(remote.host))
     cmd = 'ceph health -f json'
-    return run_on_remote(remote, cmd, jsonify=True)
+    return remote.check_call(cmd).stdout_json
 
 
 def get_monitor_node_fqdns(remote):
@@ -77,7 +77,7 @@ def get_monitor_node_fqdns(remote):
     :return: list of FQDNs
     """
     cmd = 'ceph mon_status -f json'
-    result = run_on_remote(remote, cmd, jsonify=True)
+    result = remote.check_call(cmd).stdout_json
     fqdns = [i['name'] + DNS_SUFFIX for i in result['monmap']['mons']]
     msg = "Ceph monitor service is running on {0}".format(', '.join(fqdns))
     logger.debug(msg)
@@ -136,13 +136,38 @@ def check_disks(remote, nodes_ids):
 
 
 def check_service_ready(remote, exit_code=0):
+    cmds = []
     if OPENSTACK_RELEASE_UBUNTU in OPENSTACK_RELEASE:
-        cmd = 'service ceph-all status'
+        if UBUNTU_SERVICE_PROVIDER == 'systemd':
+            # Gather services on remote node
+            cmd = 'systemctl show --property=Id ceph-mon*service '\
+                  'ceph-osd*service ceph-radosgw*service'
+            result = remote.execute(cmd)
+            if result['exit_code'] != 0:
+                return False
+
+            ceph_services = []
+            for line in result['stdout']:
+                try:
+                    _, value = line.strip().split('=', 1)
+                    ceph_services.append(value)
+                except ValueError:
+                    pass
+            for service in ceph_services:
+                cmds.append('systemctl is-active -q {}'.format(service))
+        else:
+            cmds.append('service ceph-all status')
     else:
-        cmd = 'service ceph status'
-    if remote.execute(cmd)['exit_code'] == exit_code:
-        return True
-    return False
+        cmds.append('service ceph status')
+
+    if not cmds:
+        raise Exception("Don't know how to check ceph status. "
+                        "Perhaps ceph packages are not installed")
+
+    for cmd in cmds:
+        if remote.execute(cmd)['exit_code'] != exit_code:
+            return False
+    return True
 
 
 def health_overall_status(remote):
@@ -174,7 +199,14 @@ def is_health_ok(remote):
     :param remote: devops.helpers.helpers.SSHClient
     :return: bool
     """
-    return health_overall_status(remote) == 'HEALTH_OK'
+
+    if health_overall_status(remote) == 'HEALTH_OK':
+        return True
+    if is_health_warn(remote):
+        health = get_health(remote)
+        if 'too many PGs' in health['summary'][0]['summary']:
+            return True
+    return False
 
 
 def is_health_warn(remote):
@@ -209,7 +241,7 @@ def get_osd_tree(remote):
     """
     logger.debug("Fetching Ceph OSD tree")
     cmd = 'ceph osd tree -f json'
-    return run_on_remote(remote, cmd, jsonify=True)
+    return remote.check_call(cmd).stdout_json
 
 
 def get_osd_ids(remote):
@@ -220,7 +252,7 @@ def get_osd_ids(remote):
     """
     logger.debug("Fetching Ceph OSD ids")
     cmd = 'ceph osd ls -f json'
-    return run_on_remote(remote, cmd, jsonify=True)
+    return remote.check_call(cmd).stdout_json
 
 
 def get_rbd_images_list(remote, pool):
@@ -231,4 +263,14 @@ def get_rbd_images_list(remote, pool):
     :return: JSON-like object
     """
     cmd = 'rbd --pool {pool} --format json ls -l'.format(pool=pool)
-    return run_on_remote(remote, cmd, jsonify=True)
+    return remote.check_call(cmd).stdout_json
+
+
+def get_version(remote):
+    """Returns Ceph version
+
+    :param remote: devops.helpers.helpers.SSHClient
+    :return: str
+    """
+    cmd = 'ceph --version'
+    return remote.check_call(cmd).stdout[0].split(' ')[2]

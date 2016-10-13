@@ -12,13 +12,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from __future__ import division
+
 import json
 import os
 
+from devops.helpers.helpers import wait
 from proboscis.asserts import assert_equal
 from proboscis.asserts import assert_true
 
-from devops.helpers.helpers import wait
 from fuelweb_test import logger
 
 
@@ -48,8 +50,8 @@ class RallyEngine(object):
         return [self.container_repo, tag] in existing_images
 
     def pull_image(self):
-        #TODO(apanchenko): add possibility to load image from local path or
-        #remote link provided in settings, in order to speed up downloading
+        # TODO(apanchenko): add possibility to load image from local path or
+        # remote link provided in settings, in order to speed up downloading
         cmd = 'docker pull {0}'.format(self.container_repo)
         logger.debug('Downloading Rally repository/image from registry...')
         result = self.admin_remote.execute(cmd)
@@ -62,8 +64,9 @@ class RallyEngine(object):
         if in_background:
             options = '{0} -d'.format(options)
         cmd = ("docker run {options} --user {user_id} --net=\"host\"  -e "
-               "\"http_proxy={proxy_url}\" -v {dir_for_home}:{home_bind_path} "
-               "{container_repo}:{tag} /bin/bash -c '{command}'".format(
+               "\"http_proxy={proxy_url}\" -e \"https_proxy={proxy_url}\" "
+               "-v {dir_for_home}:{home_bind_path} {container_repo}:{tag} "
+               "/bin/bash -c '{command}'".format(
                    options=options,
                    user_id=self.user_id,
                    proxy_url=self.proxy_url,
@@ -80,7 +83,7 @@ class RallyEngine(object):
 
     def setup_utils(self):
         utils = ['gawk', 'vim', 'curl']
-        cmd = ('unset http_proxy; apt-get update; '
+        cmd = ('unset http_proxy https_proxy; apt-get update; '
                'apt-get install -y {0}'.format(' '.join(utils)))
         logger.debug('Installing utils "{0}" to the Rally container...'.format(
             utils))
@@ -229,18 +232,17 @@ class RallyDeployment(object):
 
     @property
     def is_deployment_exist(self):
-        if self.uuid is not None:
-                return True
-        return False
+        return self.uuid is not None
 
     def create_deployment(self):
         if self.is_deployment_exist:
             return
-        cmd = ('export OS_USERNAME={0} OS_PASSWORD={1} OS_TENANT_NAME={2} '
-               'OS_AUTH_URL="{3}"; rally deployment create --name "{4}"'
-               ' --fromenv').format(self.username, self.password,
-                                    self.tenant_name, self.auth_url,
-                                    self.cluster_vip)
+        cmd = ('rally deployment create --name "{0}" --filename '
+               '<(echo \'{{ "admin": {{ "password": "{1}", "tenant_name": "{2}'
+               '", "username": "{3}" }}, "auth_url": "{4}", "endpoint": null, '
+               '"type": "ExistingCloud", "https_insecure": true }}\')').format(
+            self.cluster_vip, self.password, self.tenant_name, self.username,
+            self.auth_url)
         result = self.rally_engine.run_container_command(cmd)
         assert_true(self.is_deployment_exist,
                     'Rally deployment creation failed: {0}'.format(result))
@@ -275,7 +277,7 @@ class RallyTask(object):
         return self._status
 
     def prepare_scenario(self):
-        scenario_file = '{0}/fuelweb_test/rally/screnarios/{1}.json'.format(
+        scenario_file = '{0}/fuelweb_test/rally/scenarios/{1}.json'.format(
             os.environ.get("WORKSPACE", "./"), self.test_type)
         remote_path = '{0}/{1}.json'.format(self.engine.dir_for_home,
                                             self.test_type)
@@ -295,12 +297,22 @@ class RallyTask(object):
         cmd = ("awk 'BEGIN{{retval=1}};/^Using task:/{{print $NF; retval=0}};"
                "END {{exit retval}}' {0}").format(temp_file)
         wait(lambda: self.engine.run_container_command(cmd)['exit_code'] == 0,
-             timeout=30)
+             timeout=30, timeout_msg='Rally task {!r} creation timeout'
+                                     ''.format(result))
         result = self.engine.run_container_command(cmd)
         task_uuid = ''.join(result['stdout']).strip()
         assert_true(task_uuid in self.engine.list_tasks(),
                     "Rally task creation failed: {0}".format(result))
         self.uuid = task_uuid
+
+    def abort(self, task_id):
+        logger.debug('Stop Rally task {0}'.format(task_id))
+        cmd = 'rally task abort {0}'.format(task_id)
+        self.engine.run_container_command(cmd)
+        assert_true(
+            self.status in ('finished', 'aborted'),
+            "Rally task {0} was not aborted; current task status "
+            "is {1}".format(task_id, self.status))
 
     def get_results(self):
         if self.status == 'finished':
@@ -401,13 +413,15 @@ class RallyBenchmarkTest(object):
         )
         self.current_task = None
 
-    def run(self, timeout=60 * 10):
+    def run(self, timeout=60 * 10, result=True):
         self.current_task = RallyTask(self.deployment, self.test_type)
         logger.info('Starting Rally benchmark test...')
         self.current_task.start()
         assert_equal(self.current_task.status, 'running',
                      'Rally task was started, but it is not running, status: '
                      '{0}'.format(self.current_task.status))
-        wait(lambda: self.current_task.status == 'finished', timeout=timeout)
-        logger.info('Rally benchmark test is finished.')
-        return RallyResult(json_results=self.current_task.get_results())
+        if result:
+            wait(lambda: self.current_task.status == 'finished',
+                 timeout=timeout, timeout_msg='Rally benchmark test timeout')
+            logger.info('Rally benchmark test is finished.')
+            return RallyResult(json_results=self.current_task.get_results())

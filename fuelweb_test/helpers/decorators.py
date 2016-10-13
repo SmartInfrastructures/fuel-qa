@@ -17,38 +17,43 @@ import inspect
 import json
 import os
 from subprocess import call
-import requests
 import sys
 import time
 import traceback
-from urlparse import urlparse
 
-from devops.helpers import helpers
+from proboscis import SkipTest
+from proboscis.asserts import assert_equal
+from proboscis.asserts import assert_true
+# pylint: disable=import-error
+# noinspection PyUnresolvedReferences
+from six.moves import urllib
+# pylint: enable=import-error
+
+# pylint: disable=unused-import
+from core.helpers.setup_teardown import setup_teardown  # noqa
+# pylint: enable=unused-import
+
+from fuelweb_test import logger
+from fuelweb_test import settings
 from fuelweb_test.helpers.checkers import check_action_logs
 from fuelweb_test.helpers.checkers import check_repo_managment
 from fuelweb_test.helpers.checkers import check_stats_on_collector
 from fuelweb_test.helpers.checkers import check_stats_private_info
 from fuelweb_test.helpers.checkers import count_stats_on_collector
-from proboscis import SkipTest
-from proboscis.asserts import assert_equal
-
-from fuelweb_test import logger
-from fuelweb_test import settings
 from fuelweb_test.helpers.regenerate_repo import CustomRepo
+from fuelweb_test.helpers.ssh_manager import SSHManager
 from fuelweb_test.helpers.utils import get_current_env
 from fuelweb_test.helpers.utils import pull_out_logs_via_ssh
 from fuelweb_test.helpers.utils import store_astute_yaml
 from fuelweb_test.helpers.utils import store_packages_json
-from fuelweb_test.helpers.utils import timestat
+from fuelweb_test.helpers.utils import TimeStat
+from gates_tests.helpers.exceptions import ConfigurationException
 
 
-def save_logs(url, path, auth_token=None, chunk_size=1024):
+def save_logs(session, url, path, chunk_size=1024):
     logger.info('Saving logs to "%s" file', path)
-    headers = {}
-    if auth_token is not None:
-        headers['X-Auth-Token'] = auth_token
 
-    stream = requests.get(url, headers=headers, stream=True)
+    stream = session.get(url, stream=True, verify=False)
     if stream.status_code != 200:
         logger.error("%s %s: %s", stream.status_code, stream.reason,
                      stream.content)
@@ -59,6 +64,41 @@ def save_logs(url, path, auth_token=None, chunk_size=1024):
             if chunk:
                 fp.write(chunk)
                 fp.flush()
+
+
+def store_error_details(name, env):
+    description = "Failed in method {:s}.".format(name)
+    if env is not None:
+        try:
+            create_diagnostic_snapshot(env, "fail", name)
+        except:
+            logger.error("Fetching of diagnostic snapshot failed: {0}".format(
+                traceback.format_exception_only(sys.exc_info()[0],
+                                                sys.exc_info()[1])))
+            logger.debug("Fetching of diagnostic snapshot failed: {0}".
+                         format(traceback.format_exc()))
+            try:
+                with env.d_env.get_admin_remote()\
+                        as admin_remote:
+                    pull_out_logs_via_ssh(admin_remote, name)
+            except:
+                logger.error("Fetching of raw logs failed: {0}".format(
+                    traceback.format_exception_only(sys.exc_info()[0],
+                                                    sys.exc_info()[1])))
+                logger.debug("Fetching of raw logs failed: {0}".
+                             format(traceback.format_exc()))
+        finally:
+            try:
+                env.make_snapshot(snapshot_name=name[-50:],
+                                  description=description,
+                                  is_make=True)
+            except:
+                logger.error(
+                    "Error making the environment snapshot: {0}".format(
+                        traceback.format_exception_only(sys.exc_info()[0],
+                                                        sys.exc_info()[1])))
+                logger.debug("Error making the environment snapshot:"
+                             " {0}".format(traceback.format_exc()))
 
 
 def log_snapshot_after_test(func):
@@ -79,34 +119,13 @@ def log_snapshot_after_test(func):
         try:
             result = func(*args, **kwargs)
         except SkipTest:
-            raise SkipTest()
-        except Exception as test_exception:
-            exc_trace = sys.exc_traceback
-            name = 'error_%s' % func.__name__
-            description = "Failed in method '%s'." % func.__name__
-            if args[0].env is not None:
-                try:
-                    create_diagnostic_snapshot(args[0].env,
-                                               "fail", name)
-                except:
-                    logger.error("Fetching of diagnostic snapshot failed: {0}".
-                                 format(traceback.format_exc()))
-                    try:
-                        admin_remote = args[0].env.d_env.get_admin_remote()
-                        pull_out_logs_via_ssh(admin_remote, name)
-                    except:
-                        logger.error("Fetching of raw logs failed: {0}".
-                                     format(traceback.format_exc()))
-                finally:
-                    logger.debug(args)
-                    try:
-                        args[0].env.make_snapshot(snapshot_name=name[-50:],
-                                                  description=description,
-                                                  is_make=True)
-                    except:
-                        logger.error("Error making the environment snapshot:"
-                                     " {0}".format(traceback.format_exc()))
-            raise test_exception, None, exc_trace
+            raise
+        except Exception:
+            name = 'error_{:s}'.format(func.__name__)
+            store_error_details(name, args[0].env)
+            logger.error(traceback.format_exc())
+            logger.info("<" * 5 + "*" * 100 + ">" * 5)
+            raise
         else:
             if settings.ALWAYS_CREATE_DIAGNOSTIC_SNAPSHOT:
                 if args[0].env is None:
@@ -138,24 +157,26 @@ def upload_manifests(func):
         result = func(*args, **kwargs)
         try:
             if settings.UPLOAD_MANIFESTS:
-                logger.info("Uploading new manifests from %s" %
-                            settings.UPLOAD_MANIFESTS_PATH)
+                logger.info(
+                    "Uploading new manifests from "
+                    "{:s}".format(settings.UPLOAD_MANIFESTS_PATH))
                 environment = get_current_env(args)
                 if not environment:
                     logger.warning("Can't upload manifests: method of "
                                    "unexpected class is decorated.")
                     return result
-                remote = environment.d_env.get_admin_remote()
-                remote.execute('rm -rf /etc/puppet/modules/*')
-                remote.upload(settings.UPLOAD_MANIFESTS_PATH,
-                              '/etc/puppet/modules/')
-                logger.info("Copying new site.pp from %s" %
-                            settings.SITEPP_FOR_UPLOAD)
-                remote.execute("cp %s /etc/puppet/manifests" %
-                               settings.SITEPP_FOR_UPLOAD)
-                if settings.SYNC_DEPL_TASKS:
-                    remote.execute("fuel release --sync-deployment-tasks"
-                                   " --dir /etc/puppet/")
+                with environment.d_env.get_admin_remote() as remote:
+                    remote.execute('rm -rf /etc/puppet/modules/*')
+                    remote.upload(settings.UPLOAD_MANIFESTS_PATH,
+                                  '/etc/puppet/modules/')
+                    logger.info(
+                        "Copying new site.pp from "
+                        "{:s}".format(settings.SITEPP_FOR_UPLOAD))
+                    remote.execute("cp %s /etc/puppet/manifests" %
+                                   settings.SITEPP_FOR_UPLOAD)
+                    if settings.SYNC_DEPL_TASKS:
+                        remote.execute("fuel release --sync-deployment-tasks"
+                                       " --dir /etc/puppet/")
         except Exception:
             logger.error("Could not upload manifests")
             raise
@@ -163,12 +184,12 @@ def upload_manifests(func):
     return wrapper
 
 
-def update_packages(func):
+def update_rpm_packages(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         result = func(*args, **kwargs)
         if not settings.UPDATE_FUEL:
-                return result
+            return result
         try:
             environment = get_current_env(args)
             if not environment:
@@ -176,11 +197,9 @@ def update_packages(func):
                                "unexpected class is decorated.")
                 return result
 
-            remote = environment.d_env.get_admin_remote()
-
             if settings.UPDATE_FUEL_MIRROR:
                 for url in settings.UPDATE_FUEL_MIRROR:
-                    repo_url = urlparse(url)
+                    repo_url = urllib.parse.urlparse(url)
                     cut_dirs = len(repo_url.path.strip('/').split('/'))
                     download_cmd = ('wget --recursive --no-parent'
                                     ' --no-verbose --reject "index'
@@ -196,11 +215,11 @@ def update_packages(func):
                                                  ' packages '
                                                  'repository failed')
 
-            centos_files_count, ubuntu_files_count = \
+            centos_files_count, _ = \
                 environment.admin_actions.upload_packages(
                     local_packages_dir=settings.UPDATE_FUEL_PATH,
                     centos_repo_path=settings.LOCAL_MIRROR_CENTOS,
-                    ubuntu_repo_path=settings.LOCAL_MIRROR_UBUNTU)
+                    ubuntu_repo_path=None)
 
             if centos_files_count == 0:
                 return result
@@ -210,17 +229,25 @@ def update_packages(func):
             cmd = ("echo -e '[temporary]\nname=temporary\nbaseurl=file://{0}/"
                    "\ngpgcheck=0\npriority=1' > {1}").format(
                 settings.LOCAL_MIRROR_CENTOS, conf_file)
-            environment.execute_remote_cmd(remote, cmd, exit_code=0)
-            update_command = 'yum clean expire-cache; yum update -y -d3'
-            result = remote.execute(update_command)
+
+            SSHManager().execute_on_remote(
+                ip=SSHManager().admin_ip,
+                cmd=cmd
+            )
+            update_command = 'yum clean expire-cache; yum update -y -d3 ' \
+                             '2>>/var/log/yum-update-error.log'
+            cmd_result = SSHManager().execute(ip=SSHManager().admin_ip,
+                                              cmd=update_command)
             logger.debug('Result of "yum update" command on master node: '
-                         '{0}'.format(result))
-            assert_equal(int(result['exit_code']), 0,
+                         '{0}'.format(cmd_result))
+            assert_equal(int(cmd_result['exit_code']), 0,
                          'Packages update failed, '
                          'inspect logs for details')
-            environment.execute_remote_cmd(remote,
-                                           cmd='rm -f {0}'.format(conf_file),
-                                           exit_code=0)
+
+            SSHManager().execute_on_remote(
+                ip=SSHManager().admin_ip,
+                cmd='rm -f {0}'.format(conf_file)
+            )
         except Exception:
             logger.error("Could not update packages")
             raise
@@ -246,30 +273,24 @@ def update_fuel(func):
                     local_packages_dir=settings.UPDATE_FUEL_PATH,
                     centos_repo_path=settings.LOCAL_MIRROR_CENTOS,
                     ubuntu_repo_path=settings.LOCAL_MIRROR_UBUNTU)
-
-            remote = environment.d_env.get_admin_remote()
+            if not centos_files_count and not ubuntu_files_count:
+                raise ConfigurationException('Nothing to update,'
+                                             ' packages to update values is 0')
             cluster_id = environment.fuel_web.get_last_created_cluster()
 
             if centos_files_count > 0:
-                environment.docker_actions.execute_in_containers(
-                    cmd='yum -y install yum-plugin-priorities')
-
-                # Update docker containers and restart them
-                environment.docker_actions.execute_in_containers(
-                    cmd='yum clean expire-cache; yum update -y')
-                environment.docker_actions.restart_containers()
-
-                # Update packages on master node
-                remote.execute(
-                    'yum -y install yum-plugin-priorities;'
-                    'yum clean expire-cache; yum update -y')
+                with environment.d_env.get_admin_remote() as remote:
+                    # Update packages on master node
+                    remote.execute(
+                        'yum -y install yum-plugin-priorities;'
+                        'yum clean expire-cache; yum update -y '
+                        '2>>/var/log/yum-update-error.log')
 
                 # Add auxiliary repository to the cluster attributes
                 if settings.OPENSTACK_RELEASE_UBUNTU not in \
                         settings.OPENSTACK_RELEASE:
                     environment.fuel_web.add_local_centos_mirror(
-                        cluster_id, name="Auxiliary",
-                        path=settings.LOCAL_MIRROR_CENTOS,
+                        cluster_id, path=settings.LOCAL_MIRROR_CENTOS,
                         priority=settings.AUX_RPM_REPO_PRIORITY)
 
             if ubuntu_files_count > 0:
@@ -285,6 +306,7 @@ def update_fuel(func):
                                  " because of deploying wrong release!"
                                  .format(ubuntu_files_count))
             if settings.SYNC_DEPL_TASKS:
+                with environment.d_env.get_admin_remote() as remote:
                     remote.execute("fuel release --sync-deployment-tasks"
                                    " --dir /etc/puppet/")
         return result
@@ -294,7 +316,7 @@ def update_fuel(func):
 def revert_info(snapshot_name, master_ip, description=""):
     logger.info("<" * 5 + "*" * 100 + ">" * 5)
     logger.info("{} Make snapshot: {}".format(description, snapshot_name))
-    command = ("dos.py revert-resume {env} --snapshot-name {name} "
+    command = ("dos.py revert-resume {env} {name} "
                "&& ssh root@{master_ip}".format(
                    env=settings.ENV_NAME,
                    name=snapshot_name,
@@ -308,48 +330,28 @@ def revert_info(snapshot_name, master_ip, description=""):
     logger.info("<" * 5 + "*" * 100 + ">" * 5)
 
 
-def update_ostf(func):
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        result = func(*args, **kwargs)
-        try:
-            if settings.UPLOAD_PATCHSET:
-                if not settings.GERRIT_REFSPEC:
-                    raise ValueError('REFSPEC should be set for CI tests.')
-                logger.info("Uploading new patchset from {0}"
-                            .format(settings.GERRIT_REFSPEC))
-                remote = args[0].environment.d_env.get_admin_remote()
-                remote.upload(settings.PATCH_PATH.rstrip('/'),
-                              '/var/www/nailgun/fuel-ostf')
-                remote.execute('dockerctl shell ostf '
-                               'bash -c "cd /var/www/nailgun/fuel-ostf; '
-                               'python setup.py develop"')
-                remote.execute('dockerctl shell ostf '
-                               'bash -c "supervisorctl restart ostf"')
-                helpers.wait(
-                    lambda: "0" in
-                    remote.execute('dockerctl shell ostf '
-                                   'bash -c "pgrep [o]stf; echo $?"')
-                    ['stdout'][1], timeout=60)
-                logger.info("OSTF status: RUNNING")
-        except Exception as e:
-            logger.error("Could not upload patch set {e}".format(e=e))
-            raise
-        return result
-    return wrapper
+def create_diagnostic_snapshot(env, status, name="",
+                               timeout=settings.LOG_SNAPSHOT_TIMEOUT):
+    logger.debug('Starting log snapshot with '
+                 'timeout {} seconds'.format(timeout))
+    task = env.fuel_web.task_wait(env.fuel_web.client.generate_logs(), timeout)
+    assert_true(task['status'] == 'ready',
+                "Generation of diagnostic snapshot failed: {}".format(task))
+    if settings.FORCE_HTTPS_MASTER_NODE:
+        url = "https://{}:8443{}".format(env.get_admin_node_ip(),
+                                         task['message'])
+    else:
+        url = "http://{}:8000{}".format(env.get_admin_node_ip(),
+                                        task['message'])
 
-
-def create_diagnostic_snapshot(env, status, name=""):
-    task = env.fuel_web.task_wait(env.fuel_web.client.generate_logs(), 60 * 5)
-    url = "http://{}:8000{}".format(
-        env.get_admin_node_ip(), task['message']
-    )
     log_file_name = '{status}_{name}-{basename}'.format(
         status=status,
         name=name,
         basename=os.path.basename(task['message']))
-    save_logs(url, os.path.join(settings.LOGS_DIR, log_file_name),
-              auth_token=env.fuel_web.client.client.token)
+    save_logs(
+        session=env.fuel_web.client.session,
+        url=url,
+        path=os.path.join(settings.LOGS_DIR, log_file_name))
 
 
 def retry(count=3, delay=30):
@@ -372,7 +374,7 @@ def retry(count=3, delay=30):
 def custom_repo(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        custom_pkgs = CustomRepo(args[0].environment.d_env.get_admin_remote())
+        custom_pkgs = CustomRepo()
         try:
             if settings.CUSTOM_PKGS_MIRROR:
                 custom_pkgs.prepare_repository()
@@ -398,7 +400,7 @@ def check_fuel_statistics(func):
         if not settings.FUEL_STATS_CHECK:
             return result
         logger.info('Test "{0}" passed. Checking stats.'.format(func.__name__))
-        fuel_settings = args[0].env.get_fuel_settings()
+        fuel_settings = args[0].env.admin_actions.get_fuel_settings()
         nailgun_actions = args[0].env.nailgun_actions
         postgres_actions = args[0].env.postgres_actions
         remote_collector = args[0].env.collector
@@ -492,7 +494,7 @@ def duration(func):
     """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        with timestat(func.__name__):
+        with TimeStat(func.__name__):
             return func(*args, **kwargs)
     return wrapper
 
@@ -502,12 +504,30 @@ def check_repos_management(func):
     def wrapper(*args, **kwargs):
         result = func(*args, **kwargs)
         # FIXME: Enable me for all release after fix #1403088 and #1448114
-        if settings.OPENSTACK_RELEASE == settings.OPENSTACK_RELEASE_UBUNTU:
-            env = get_current_env(args)
-            nailgun_nodes = env.fuel_web.client.list_cluster_nodes(
-                env.fuel_web.get_last_created_cluster())
-            for n in nailgun_nodes:
-                check_repo_managment(
-                    env.d_env.get_ssh_to_remote(n['ip']))
+        if settings.OPENSTACK_RELEASE_UBUNTU in settings.OPENSTACK_RELEASE:
+            try:
+                env = get_current_env(args)
+                nailgun_nodes = env.fuel_web.client.list_cluster_nodes(
+                    env.fuel_web.get_last_created_cluster())
+                for n in nailgun_nodes:
+                    logger.debug("Check repository management on {0}"
+                                 .format(n['ip']))
+                    check_repo_managment(n['ip'])
+            except Exception:
+                logger.error("An error happened during check repositories "
+                             "management on nodes. Please see the debug log.")
         return result
+    return wrapper
+
+
+def token(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except AssertionError:
+            logger.info("Response code not equivalent to 200,"
+                        " trying to update the token")
+            args[0].login()
+            return func(*args, **kwargs)
     return wrapper

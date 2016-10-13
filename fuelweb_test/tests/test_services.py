@@ -19,10 +19,11 @@ from proboscis import test
 from proboscis.asserts import assert_equal
 
 from fuelweb_test.helpers import checkers
+from fuelweb_test.helpers import utils
 from fuelweb_test.helpers.decorators import log_snapshot_after_test
 from fuelweb_test.helpers import os_actions
 from fuelweb_test import settings
-from fuelweb_test import logger as LOGGER
+from fuelweb_test import logger
 from fuelweb_test.tests.base_test_case import SetupEnvironment
 from fuelweb_test.tests.base_test_case import TestBasic
 
@@ -34,10 +35,10 @@ class SaharaHAOneController(TestBasic):
     Put Sahara image before start
     """
     @test(depends_on=[SetupEnvironment.prepare_slaves_3],
-          groups=["deploy_sahara_ha_one_controller_gre"])
+          groups=["deploy_sahara_ha_one_controller_tun"])
     @log_snapshot_after_test
-    def deploy_sahara_ha_one_controller_gre(self):
-        """Deploy cluster in ha mode with 1 controller Sahara and Neutron GRE
+    def deploy_sahara_ha_one_controller_tun(self):
+        """Deploy cluster in ha mode with 1 controller Sahara and Neutron VXLAN
 
         Scenario:
             1. Create a Fuel cluster. Set the option for Sahara installation
@@ -50,22 +51,16 @@ class SaharaHAOneController(TestBasic):
             8. Run platform Vanilla2 test for Sahara
 
         Duration 65m
-        Snapshot: deploy_sahara_ha_one_controller_gre
+        Snapshot: deploy_sahara_ha_one_controller_tun
         """
-        LOGGER.debug('Check MD5 sum of Vanilla2 image')
-        check_image = checkers.check_image(
-            settings.SERVTEST_SAHARA_VANILLA_2_IMAGE,
-            settings.SERVTEST_SAHARA_VANILLA_2_IMAGE_MD5,
-            settings.SERVTEST_LOCAL_PATH)
-        asserts.assert_true(check_image)
 
         self.env.revert_snapshot("ready_with_3_slaves")
 
-        LOGGER.debug('Create Fuel cluster for Sahara tests')
+        logger.debug('Create Fuel cluster for Sahara tests')
         data = {
             'sahara': True,
             'net_provider': 'neutron',
-            'net_segment_type': 'gre',
+            'net_segment_type': settings.NEUTRON_SEGMENT['tun'],
             'tenant': 'saharaSimple',
             'user': 'saharaSimple',
             'password': 'saharaSimple'
@@ -86,16 +81,23 @@ class SaharaHAOneController(TestBasic):
         os_conn = os_actions.OpenStackActions(
             self.fuel_web.get_public_vip(cluster_id),
             data['user'], data['password'], data['tenant'])
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=5, networks_count=2, timeout=300)
+        self.fuel_web.assert_cluster_ready(os_conn, smiles_count=5)
 
-        LOGGER.debug('Verify Sahara service on controller')
+        logger.debug('Verify Sahara service on controller')
         _ip = self.fuel_web.get_nailgun_node_by_name("slave-01")['ip']
-        checkers.verify_service(
-            self.env.d_env.get_ssh_to_remote(_ip),
-            service_name='sahara-all')
+        # count = 1 + api_workers (from sahara.conf)
+        checkers.verify_service(_ip, service_name='sahara-api', count=2)
+        # count = 2 * 1 (hardcoded by deployment team)
+        checkers.verify_service(_ip, service_name='sahara-engine', count=2)
 
-        LOGGER.debug('Run all sanity and smoke tests')
+        logger.debug('Check MD5 sum of Vanilla2 image')
+        check_image = checkers.check_image(
+            settings.SERVTEST_SAHARA_VANILLA_2_IMAGE,
+            settings.SERVTEST_SAHARA_VANILLA_2_IMAGE_MD5,
+            settings.SERVTEST_LOCAL_PATH)
+        asserts.assert_true(check_image)
+
+        logger.debug('Run all sanity and smoke tests')
         path_to_tests = 'fuel_health.tests.sanity.test_sanity_sahara.'
         test_names = ['VanillaTwoTemplatesTest.test_vanilla_two_templates',
                       'HDPTwoTemplatesTest.test_hdp_two_templates']
@@ -105,7 +107,7 @@ class SaharaHAOneController(TestBasic):
                                   for test_name in test_names]
         )
 
-        LOGGER.debug('Import Vanilla2 image for Sahara')
+        logger.debug('Import Vanilla2 image for Sahara')
 
         with open('{0}/{1}'.format(
                 settings.SERVTEST_LOCAL_PATH,
@@ -121,12 +123,12 @@ class SaharaHAOneController(TestBasic):
         path_to_tests = 'fuel_health.tests.tests_platform.test_sahara.'
         test_names = ['VanillaTwoClusterTest.test_vanilla_two_cluster']
         for test_name in test_names:
-            LOGGER.debug('Run platform test {0} for Sahara'.format(test_name))
+            logger.debug('Run platform test {0} for Sahara'.format(test_name))
             self.fuel_web.run_single_ostf_test(
                 cluster_id=cluster_id, test_sets=['tests_platform'],
                 test_name=path_to_tests + test_name, timeout=60 * 200)
 
-        self.env.make_snapshot("deploy_sahara_ha_one_controller_gre")
+        self.env.make_snapshot("deploy_sahara_ha_one_controller_tun")
 
 
 @test(groups=["services", "services.sahara", "services_ha"])
@@ -136,10 +138,10 @@ class SaharaHA(TestBasic):
     Put Sahara image before start
     """
     @test(depends_on=[SetupEnvironment.prepare_slaves_5],
-          groups=["deploy_sahara_ha_gre"])
+          groups=["deploy_sahara_ha_tun"])
     @log_snapshot_after_test
-    def deploy_sahara_ha_gre(self):
-        """Deploy cluster in HA mode with Sahara and Neutron GRE
+    def deploy_sahara_ha_tun(self):
+        """Deploy cluster in HA mode with Sahara and Neutron VXLAN
 
         Scenario:
             1. Create a Fuel cluster. Set the option for Sahara installation
@@ -152,23 +154,17 @@ class SaharaHA(TestBasic):
             8. Run platform Vanilla2 test for Sahara
 
         Duration 130m
-        Snapshot: deploy_sahara_ha_gre
+        Snapshot: deploy_sahara_ha_tun
 
         """
-        LOGGER.debug('Check MD5 sum of Vanilla2 image')
-        check_image = checkers.check_image(
-            settings.SERVTEST_SAHARA_VANILLA_2_IMAGE,
-            settings.SERVTEST_SAHARA_VANILLA_2_IMAGE_MD5,
-            settings.SERVTEST_LOCAL_PATH)
-        asserts.assert_true(check_image)
 
         self.env.revert_snapshot("ready_with_5_slaves")
 
-        LOGGER.debug('Create Fuel cluster for Sahara tests')
+        logger.debug('Create Fuel cluster for Sahara tests')
         data = {
             'sahara': True,
             'net_provider': 'neutron',
-            'net_segment_type': 'gre',
+            'net_segment_type': settings.NEUTRON_SEGMENT['tun'],
             'tenant': 'saharaHA',
             'user': 'saharaHA',
             'password': 'saharaHA'
@@ -191,17 +187,25 @@ class SaharaHA(TestBasic):
         cluster_vip = self.fuel_web.get_public_vip(cluster_id)
         os_conn = os_actions.OpenStackActions(
             cluster_vip, data['user'], data['password'], data['tenant'])
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=13, networks_count=2, timeout=300)
+        self.fuel_web.assert_cluster_ready(os_conn, smiles_count=13)
 
-        LOGGER.debug('Verify Sahara service on all controllers')
+        logger.debug('Verify Sahara service on all controllers')
         for slave in ["slave-01", "slave-02", "slave-03"]:
             _ip = self.fuel_web.get_nailgun_node_by_name(slave)['ip']
-            checkers.verify_service(
-                self.env.d_env.get_ssh_to_remote(_ip),
-                service_name='sahara-all')
+            # count = 1 + api_workers (from sahara.conf)
+            checkers.verify_service(_ip, service_name='sahara-api', count=2)
+            # count = 2 * 1 (hardcoded by deployment team)
+            checkers.verify_service(_ip,
+                                    service_name='sahara-engine', count=2)
 
-        LOGGER.debug('Run all sanity and smoke tests')
+        logger.debug('Check MD5 sum of Vanilla2 image')
+        check_image = checkers.check_image(
+            settings.SERVTEST_SAHARA_VANILLA_2_IMAGE,
+            settings.SERVTEST_SAHARA_VANILLA_2_IMAGE_MD5,
+            settings.SERVTEST_LOCAL_PATH)
+        asserts.assert_true(check_image)
+
+        logger.debug('Run all sanity and smoke tests')
         path_to_tests = 'fuel_health.tests.sanity.test_sanity_sahara.'
         test_names = ['VanillaTwoTemplatesTest.test_vanilla_two_templates',
                       'HDPTwoTemplatesTest.test_hdp_two_templates']
@@ -211,7 +215,7 @@ class SaharaHA(TestBasic):
                                   for test_name in test_names]
         )
 
-        LOGGER.debug('Import Vanilla2 image for Sahara')
+        logger.debug('Import Vanilla2 image for Sahara')
 
         with open('{0}/{1}'.format(
                 settings.SERVTEST_LOCAL_PATH,
@@ -227,12 +231,12 @@ class SaharaHA(TestBasic):
         path_to_tests = 'fuel_health.tests.tests_platform.test_sahara.'
         test_names = ['VanillaTwoClusterTest.test_vanilla_two_cluster']
         for test_name in test_names:
-            LOGGER.debug('Run platform test {0} for Sahara'.format(test_name))
+            logger.debug('Run platform test {0} for Sahara'.format(test_name))
             self.fuel_web.run_single_ostf_test(
                 cluster_id=cluster_id, test_sets=['tests_platform'],
                 test_name=path_to_tests + test_name, timeout=60 * 200)
 
-        self.env.make_snapshot("deploy_sahara_ha_gre")
+        self.env.make_snapshot("deploy_sahara_ha_tun")
 
 
 @test(groups=["services", "services.murano", "services_ha_one_controller"])
@@ -241,10 +245,10 @@ class MuranoHAOneController(TestBasic):
     Don't recommend to start tests without kvm.
     """
     @test(depends_on=[SetupEnvironment.prepare_slaves_3],
-          groups=["deploy_murano_ha_one_controller_gre"])
+          groups=["deploy_murano_ha_one_controller_tun"])
     @log_snapshot_after_test
-    def deploy_murano_ha_one_controller_gre(self):
-        """Deploy cluster in HA mode with Murano and Neutron GRE
+    def deploy_murano_ha_one_controller_tun(self):
+        """Deploy cluster in HA mode with Murano and Neutron VXLAN
 
         Scenario:
             1. Create cluster. Set install Murano option
@@ -256,14 +260,14 @@ class MuranoHAOneController(TestBasic):
             7. Run OSTF Murano platform tests
 
         Duration 40m
-        Snapshot: deploy_murano_ha_one_controller_gre
+        Snapshot: deploy_murano_ha_one_controller_tun
         """
         self.env.revert_snapshot("ready_with_3_slaves")
 
         data = {
             'murano': True,
             'net_provider': 'neutron',
-            'net_segment_type': 'gre',
+            'net_segment_type': settings.NEUTRON_SEGMENT['tun'],
             'tenant': 'muranoSimple',
             'user': 'muranoSimple',
             'password': 'muranoSimple'
@@ -272,7 +276,12 @@ class MuranoHAOneController(TestBasic):
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
             mode=settings.DEPLOYMENT_MODE,
-            settings=data)
+            settings=data,
+            configure_ssl=False
+        )
+        # TODO(freerunner): Need to configure SSL again when root cause for
+        # TODO(freerunner): https://bugs.launchpad.net/fuel/+bug/1590633
+        # TODO(freerunner): will be found and fixed
 
         self.fuel_web.update_nodes(
             cluster_id,
@@ -283,29 +292,17 @@ class MuranoHAOneController(TestBasic):
         )
 
         self.fuel_web.deploy_cluster_wait(cluster_id)
-        os_conn = os_actions.OpenStackActions(
-            self.fuel_web.get_public_vip(cluster_id),
-            data['user'], data['password'], data['tenant'])
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=5, networks_count=2, timeout=300)
         _ip = self.fuel_web.get_nailgun_node_by_name("slave-01")['ip']
-        checkers.verify_service(
-            self.env.d_env.get_ssh_to_remote(_ip),
-            service_name='murano-api')
+        checkers.verify_service(_ip, service_name='murano-api')
 
-        LOGGER.debug('Run sanity and functional Murano OSTF tests')
-        self.fuel_web.run_single_ostf_test(
-            cluster_id=self.fuel_web.get_last_created_cluster(),
-            test_sets=['sanity'],
-            test_name=('fuel_health.tests.sanity.test_sanity_murano.'
-                       'MuranoSanityTests.test_create_and_delete_service')
-        )
+        logger.debug('Run sanity and functional Murano OSTF tests')
+        self.fuel_web.run_ostf(cluster_id=cluster_id, test_sets=['sanity'])
 
-        LOGGER.debug('Run OSTF platform tests')
+        logger.debug('Run OSTF platform tests')
 
         test_class_main = ('fuel_health.tests.tests_platform'
                            '.test_murano_linux.MuranoDeployLinuxServicesTests')
-        tests_names = ['test_deploy_dummy_app', ]
+        tests_names = ['test_deploy_dummy_app_with_glare', ]
 
         test_classes = []
 
@@ -318,7 +315,7 @@ class MuranoHAOneController(TestBasic):
                 cluster_id=cluster_id, test_sets=['tests_platform'],
                 test_name=test_name, timeout=60 * 20)
 
-        self.env.make_snapshot("deploy_murano_ha_one_controller_gre")
+        self.env.make_snapshot("deploy_murano_ha_one_controller_tun")
 
 
 @test(groups=["services", "services.murano", "services_ha"])
@@ -327,10 +324,10 @@ class MuranoHA(TestBasic):
     Don't recommend to start tests without kvm.
     """
     @test(depends_on=[SetupEnvironment.prepare_slaves_5],
-          groups=["deploy_murano_ha_with_gre"])
+          groups=["deploy_murano_ha_with_tun"])
     @log_snapshot_after_test
-    def deploy_murano_ha_with_gre(self):
-        """Deploy cluster in ha mode with Murano and Neutron GRE
+    def deploy_murano_ha_with_tun(self):
+        """Deploy cluster in ha mode with Murano and Neutron VXLAN
 
         Scenario:
             1. Create cluster. Set install Murano option
@@ -342,7 +339,7 @@ class MuranoHA(TestBasic):
             7. Run OSTF Murano platform tests
 
         Duration 100m
-        Snapshot: deploy_murano_ha_with_gre
+        Snapshot: deploy_murano_ha_with_tun
 
         """
         self.env.revert_snapshot("ready_with_5_slaves")
@@ -350,7 +347,7 @@ class MuranoHA(TestBasic):
         data = {
             'murano': True,
             'net_provider': 'neutron',
-            'net_segment_type': 'gre',
+            'net_segment_type': settings.NEUTRON_SEGMENT['tun'],
             'tenant': 'muranoHA',
             'user': 'muranoHA',
             'password': 'muranoHA'
@@ -359,7 +356,12 @@ class MuranoHA(TestBasic):
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
             mode=settings.DEPLOYMENT_MODE,
-            settings=data)
+            settings=data,
+            configure_ssl=False
+        )
+        # TODO(freerunner): Need to configure SSL again when root cause for
+        # TODO(freerunner): https://bugs.launchpad.net/fuel/+bug/1590633
+        # TODO(freerunner): will be found and fixed
 
         self.fuel_web.update_nodes(
             cluster_id,
@@ -371,30 +373,18 @@ class MuranoHA(TestBasic):
             }
         )
         self.fuel_web.deploy_cluster_wait(cluster_id)
-        cluster_vip = self.fuel_web.get_public_vip(cluster_id)
-        os_conn = os_actions.OpenStackActions(
-            cluster_vip, data['user'], data['password'], data['tenant'])
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=13, networks_count=2, timeout=300)
         for slave in ["slave-01", "slave-02", "slave-03"]:
             _ip = self.fuel_web.get_nailgun_node_by_name(slave)['ip']
-            checkers.verify_service(
-                self.env.d_env.get_ssh_to_remote(_ip),
-                service_name='murano-api')
+            checkers.verify_service(_ip, service_name='murano-api')
 
-        LOGGER.debug('Run sanity and functional Murano OSTF tests')
-        self.fuel_web.run_single_ostf_test(
-            cluster_id=self.fuel_web.get_last_created_cluster(),
-            test_sets=['sanity'],
-            test_name=('fuel_health.tests.sanity.test_sanity_murano.'
-                       'MuranoSanityTests.test_create_and_delete_service')
-        )
+        logger.debug('Run sanity and functional Murano OSTF tests')
+        self.fuel_web.run_ostf(cluster_id=cluster_id, test_sets=['sanity'])
 
-        LOGGER.debug('Run OSTF platform tests')
+        logger.debug('Run OSTF platform tests')
 
         test_class_main = ('fuel_health.tests.tests_platform'
                            '.test_murano_linux.MuranoDeployLinuxServicesTests')
-        tests_names = ['test_deploy_dummy_app', ]
+        tests_names = ['test_deploy_dummy_app_with_glare']
 
         test_classes = []
 
@@ -407,7 +397,7 @@ class MuranoHA(TestBasic):
                 cluster_id=cluster_id, test_sets=['tests_platform'],
                 test_name=test_name, timeout=60 * 20)
 
-        self.env.make_snapshot("deploy_murano_ha_with_gre")
+        self.env.make_snapshot("deploy_murano_ha_with_tun")
 
 
 class OSTFCeilometerHelper(TestBasic):
@@ -415,25 +405,26 @@ class OSTFCeilometerHelper(TestBasic):
     def run_tests(self, cluster_id, skip_tests=None):
         """Method run smoke, sanity and platform Ceilometer tests."""
 
-        LOGGER.debug('Run sanity and smoke tests')
+        logger.debug('Run sanity and smoke tests')
         self.fuel_web.run_ostf(
             cluster_id=cluster_id,
             test_sets=['smoke', 'sanity'],
-            timeout=60 * 10
+            timeout=60 * 15
         )
 
-        LOGGER.debug('Run platform OSTF Ceilometer tests')
+        logger.debug('Run platform OSTF Ceilometer tests')
 
         test_class_main = ('fuel_health.tests.tests_platform.'
                            'test_ceilometer.'
                            'CeilometerApiPlatformTests')
         tests_names = ['test_check_alarm_state',
                        'test_create_sample',
-                       'test_check_volume_notifications',
+                       'test_check_volume_events',
                        'test_check_glance_notifications',
                        'test_check_keystone_notifications',
                        'test_check_neutron_notifications',
-                       'test_check_sahara_notifications']
+                       'test_check_sahara_notifications',
+                       'test_check_events_and_traits']
 
         test_classes = []
 
@@ -441,8 +432,9 @@ class OSTFCeilometerHelper(TestBasic):
             test_classes.append('{0}.{1}'.format(test_class_main,
                                                  test_name))
 
-        all_tests = [test['id'] for test
-                     in self.fuel_web.client.get_ostf_tests(cluster_id)]
+        all_tests = [
+            test['id'] for test
+            in self.fuel_web.fuel_client.ostf.get_tests(cluster_id)]
 
         for test_id in test_classes:
             if test_id in all_tests:
@@ -454,7 +446,7 @@ class OSTFCeilometerHelper(TestBasic):
 
                     test_name = next(
                         test['name'] for test
-                        in self.fuel_web.client.get_ostf_tests(cluster_id)
+                        in self.fuel_web.fuel_client.ostf.get_tests(cluster_id)
                         if test['id'] == test_id)
 
                     status = next(test.values()[0]
@@ -500,6 +492,8 @@ class CeilometerHAOneControllerMongo(OSTFCeilometerHelper):
             mode=settings.DEPLOYMENT_MODE,
             settings={
                 'ceilometer': True,
+                'net_provider': 'neutron',
+                'net_segment_type': 'tun',
                 'tenant': 'ceilometerSimple',
                 'user': 'ceilometerSimple',
                 'password': 'ceilometerSimple'
@@ -521,10 +515,12 @@ class CeilometerHAOneControllerMongo(OSTFCeilometerHelper):
                 disk_mb = self.fuel_web.get_node_disk_size(node.get('id'),
                                                            "vda")
 
-        LOGGER.debug('disk size is {0}'.format(disk_mb))
+        logger.debug('disk size is {0}'.format(disk_mb))
         mongo_disk_mb = 11116
         os_disk_mb = disk_mb - mongo_disk_mb
+        # pylint:  disable=round-builtin
         mongo_disk_gb = ("{0}G".format(round(mongo_disk_mb / 1024, 1)))
+        # pylint:  enable=round-builtin
         disk_part = {
             "vda": {
                 "os": os_disk_mb,
@@ -539,13 +535,13 @@ class CeilometerHAOneControllerMongo(OSTFCeilometerHelper):
         self.fuel_web.deploy_cluster_wait(cluster_id)
 
         _ip = self.fuel_web.get_nailgun_node_by_name("slave-01")['ip']
-        checkers.verify_service(
-            self.env.d_env.get_ssh_to_remote(_ip),
-            service_name='ceilometer-api')
+        checkers.verify_service(_ip,
+                                service_name='ceilometer-api',
+                                ignore_count_of_proccesses=True)
 
         _ip = self.fuel_web.get_nailgun_node_by_name("slave-03")['ip']
-        partitions = checkers.get_mongo_partitions(
-            self.env.d_env.get_ssh_to_remote(_ip), "vda5")
+        partitions = utils.get_mongo_partitions(_ip, "vda5")
+
         assert_equal(partitions[0].rstrip(), mongo_disk_gb,
                      'Mongo size {0} before deployment is not equal'
                      ' to size after {1}'.format(mongo_disk_gb, partitions))
@@ -578,7 +574,9 @@ class CeilometerHAOneControllerMongo(OSTFCeilometerHelper):
             name=self.__class__.__name__,
             mode=settings.DEPLOYMENT_MODE,
             settings={
-                'ceilometer': True
+                'ceilometer': True,
+                'net_provider': 'neutron',
+                'net_segment_type': 'tun',
             }
         )
         self.fuel_web.update_nodes(
@@ -592,12 +590,12 @@ class CeilometerHAOneControllerMongo(OSTFCeilometerHelper):
         self.fuel_web.deploy_cluster_wait(cluster_id)
 
         _ip = self.fuel_web.get_nailgun_node_by_name("slave-01")['ip']
-        checkers.verify_service(
-            self.env.d_env.get_ssh_to_remote(_ip),
-            service_name='ceilometer-api')
+        checkers.verify_service(_ip,
+                                service_name='ceilometer-api',
+                                ignore_count_of_proccesses=True)
 
         self.run_tests(cluster_id)
-        self.env.make_snapshot("deploy_ceilometer_ha_one_controller_mulirole")
+        self.env.make_snapshot("deploy_ceilometer_ha_one_controller_multirole")
 
 
 @test(groups=["services", "services.ceilometer", "services_ha.ceilometer"])
@@ -629,6 +627,8 @@ class CeilometerHAMongo(OSTFCeilometerHelper):
             mode=settings.DEPLOYMENT_MODE,
             settings={
                 'ceilometer': True,
+                'net_provider': 'neutron',
+                'net_segment_type': 'tun',
                 'tenant': 'ceilometerHA',
                 'user': 'ceilometerHA',
                 'password': 'ceilometerHA'
@@ -647,12 +647,12 @@ class CeilometerHAMongo(OSTFCeilometerHelper):
         self.fuel_web.deploy_cluster_wait(cluster_id)
 
         _ip = self.fuel_web.get_nailgun_node_by_name("slave-01")['ip']
-        checkers.verify_service(
-            self.env.d_env.get_ssh_to_remote(_ip),
-            service_name='ceilometer-api')
+        checkers.verify_service(_ip,
+                                service_name='ceilometer-api',
+                                ignore_count_of_proccesses=True)
 
         self.run_tests(cluster_id,
-                       skip_tests=['test_check_volume_notifications'])
+                       skip_tests=['test_check_volume_events'])
         self.env.make_snapshot("deploy_ceilometer_ha_with_mongo")
 
     @test(depends_on=[SetupEnvironment.prepare_slaves_5],
@@ -680,7 +680,9 @@ class CeilometerHAMongo(OSTFCeilometerHelper):
             name=self.__class__.__name__,
             mode=settings.DEPLOYMENT_MODE,
             settings={
-                'ceilometer': True
+                'ceilometer': True,
+                'net_provider': 'neutron',
+                'net_segment_type': 'tun',
             }
         )
         self.fuel_web.update_nodes(
@@ -696,12 +698,42 @@ class CeilometerHAMongo(OSTFCeilometerHelper):
         self.fuel_web.deploy_cluster_wait(cluster_id)
 
         _ip = self.fuel_web.get_nailgun_node_by_name("slave-01")['ip']
-        checkers.verify_service(
-            self.env.d_env.get_ssh_to_remote(_ip),
-            service_name='ceilometer-api')
+        checkers.verify_service(_ip,
+                                service_name='ceilometer-api',
+                                ignore_count_of_proccesses=True)
 
         self.run_tests(cluster_id)
-        self.env.make_snapshot("deploy_ceilometer_ha_mulirole")
+        self.env.make_snapshot("deploy_ceilometer_ha_multirole", is_make=True)
+
+    @test(depends_on=[deploy_ceilometer_ha_multirole],
+          groups=["ceilometer_ha_multirole_add_mongo"])
+    @log_snapshot_after_test
+    def ceilometer_ha_multirole_add_mongo(self):
+        """Add mongo node to cluster with HA mode and Ceilometer
+
+        Scenario:
+            1. Revert snapshot deploy_ceilometer_ha_multirole
+            2. Add 1 node with mongo role
+            3. Deploy the cluster
+            4. Run OSTF
+
+        Duration 60m
+        Snapshot: ceilometer_ha_multirole_add_mongo
+
+        """
+        self.env.revert_snapshot("deploy_ceilometer_ha_multirole")
+        cluster_id = self.fuel_web.get_last_created_cluster()
+
+        self.env.bootstrap_nodes(
+            self.env.d_env.nodes().slaves[5:6])
+        self.fuel_web.update_nodes(
+            cluster_id, {'slave-06': ['mongo']}, True, False
+        )
+        self.fuel_web.deploy_cluster_wait(cluster_id)
+
+        self.run_tests(cluster_id)
+
+        self.env.make_snapshot("ceilometer_ha_multirole_add_mongo")
 
     @test(depends_on=[SetupEnvironment.prepare_slaves_5],
           groups=["deploy_ceilometer_ha_with_external_mongo"])
@@ -733,6 +765,8 @@ class CeilometerHAMongo(OSTFCeilometerHelper):
                 'tenant': 'ceilometerHA',
                 'user': 'ceilometerHA',
                 'password': 'ceilometerHA',
+                'net_provider': 'neutron',
+                'net_segment_type': 'tun',
                 'volumes_ceph': True,
                 'images_ceph': True,
                 'volumes_lvm': False,
@@ -758,9 +792,9 @@ class CeilometerHAMongo(OSTFCeilometerHelper):
         self.fuel_web.deploy_cluster_wait(cluster_id)
 
         _ip = self.fuel_web.get_nailgun_node_by_name("slave-01")['ip']
-        checkers.verify_service(
-            self.env.d_env.get_ssh_to_remote(_ip),
-            service_name='ceilometer-api')
+        checkers.verify_service(_ip,
+                                service_name='ceilometer-api',
+                                ignore_count_of_proccesses=True)
 
         self.run_tests(cluster_id)
         self.env.make_snapshot("deploy_ceilometer_ha_with_external_mongo")
@@ -775,7 +809,7 @@ class HeatHAOneController(TestBasic):
           groups=["deploy_heat_ha_one_controller_neutron"])
     @log_snapshot_after_test
     def deploy_heat_ha_one_controller_neutron(self):
-        """Deploy Heat cluster in HA mode with Neutron GRE
+        """Deploy Heat cluster in HA mode with Neutron VXLAN
 
         Scenario:
             1. Create cluster
@@ -795,7 +829,7 @@ class HeatHAOneController(TestBasic):
         data = {
             'ceilometer': True,
             'net_provider': 'neutron',
-            'net_segment_type': 'gre',
+            'net_segment_type': settings.NEUTRON_SEGMENT['tun'],
             'tenant': 'heatSimple',
             'user': 'heatSimple',
             'password': 'heatSimple'
@@ -818,20 +852,17 @@ class HeatHAOneController(TestBasic):
         os_conn = os_actions.OpenStackActions(
             self.fuel_web.get_public_vip(cluster_id),
             data['user'], data['password'], data['tenant'])
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=5, networks_count=2, timeout=300)
+        self.fuel_web.assert_cluster_ready(os_conn, smiles_count=5)
 
         _ip = self.fuel_web.get_nailgun_node_by_name("slave-01")['ip']
-        checkers.verify_service(
-            self.env.d_env.get_ssh_to_remote(_ip),
-            service_name='heat-api', count=3)
+        checkers.verify_service(_ip, service_name='heat-api', count=5)
 
         _ip = self.fuel_web.get_nailgun_node_by_name("slave-01")['ip']
-        checkers.verify_service(
-            self.env.d_env.get_ssh_to_remote(_ip),
-            service_name='ceilometer-api')
+        checkers.verify_service(_ip,
+                                service_name='ceilometer-api',
+                                ignore_count_of_proccesses=True)
 
-        LOGGER.debug('Run Heat OSTF platform tests')
+        logger.debug('Run Heat OSTF platform tests')
 
         test_class_main = ('fuel_health.tests.tests_platform.'
                            'test_heat.'
@@ -840,7 +871,8 @@ class HeatHAOneController(TestBasic):
                        'test_advanced_actions',
                        'test_autoscaling',
                        'test_rollback',
-                       'test_update']
+                       'test_update',
+                       'test_wait_condition']
 
         test_classes = []
 
@@ -854,88 +886,6 @@ class HeatHAOneController(TestBasic):
                 test_name=test_name, timeout=60 * 60)
 
         self.env.make_snapshot("deploy_heat_ha_one_controller_neutron")
-
-    @test(depends_on=[SetupEnvironment.prepare_slaves_3],
-          groups=["deploy_heat_ha_one_controller_nova"])
-    @log_snapshot_after_test
-    def deploy_heat_ha_one_controller_nova(self):
-        """Deploy Heat cluster in ha mode with Nova Network
-
-        Scenario:
-            1. Create cluster
-            2. Add 1 node with controller role and mongo
-            3. Add 1 nodes with compute role
-            4. Set Ceilometer install option
-            5. Deploy the cluster
-            6. Verify Heat, Ceilometer services
-            7. Run OSTF platform tests
-
-        Duration 40m
-        Snapshot: deploy_heat_ha_one_controller_nova
-        """
-
-        self.env.revert_snapshot("ready_with_3_slaves")
-
-        data = {
-            'ceilometer': True,
-            'tenant': 'heatSimple',
-            'user': 'heatSimple',
-            'password': 'heatSimple'
-        }
-
-        cluster_id = self.fuel_web.create_cluster(
-            name=self.__class__.__name__,
-            mode=settings.DEPLOYMENT_MODE,
-            settings=data)
-
-        self.fuel_web.update_nodes(
-            cluster_id,
-            {
-                'slave-01': ['controller', 'mongo'],
-                'slave-02': ['compute']
-            }
-        )
-        self.fuel_web.deploy_cluster_wait(cluster_id)
-
-        os_conn = os_actions.OpenStackActions(
-            self.fuel_web.get_public_vip(cluster_id),
-            data['user'], data['password'], data['tenant'])
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=6, networks_count=1, timeout=300)
-
-        _ip = self.fuel_web.get_nailgun_node_by_name("slave-01")['ip']
-        checkers.verify_service(
-            self.env.d_env.get_ssh_to_remote(_ip),
-            service_name='heat-api', count=3)
-
-        _ip = self.fuel_web.get_nailgun_node_by_name("slave-01")['ip']
-        checkers.verify_service(
-            self.env.d_env.get_ssh_to_remote(_ip),
-            service_name='ceilometer-api')
-
-        LOGGER.debug('Run Heat OSTF platform tests')
-
-        test_class_main = ('fuel_health.tests.tests_platform.'
-                           'test_heat.'
-                           'HeatSmokeTests')
-        tests_names = ['test_actions',
-                       'test_advanced_actions',
-                       'test_autoscaling',
-                       'test_rollback',
-                       'test_update']
-
-        test_classes = []
-
-        for test_name in tests_names:
-            test_classes.append('{0}.{1}'.format(test_class_main,
-                                                 test_name))
-
-        for test_name in test_classes:
-            self.fuel_web.run_single_ostf_test(
-                cluster_id=cluster_id, test_sets=['tests_platform'],
-                test_name=test_name, timeout=60 * 60)
-
-        self.env.make_snapshot("deploy_heat_ha_one_controller_nova")
 
 
 @test(groups=["services", "services.heat", "services_ha"])
@@ -967,7 +917,7 @@ class HeatHA(TestBasic):
         data = {
             'ceilometer': True,
             'net_provider': 'neutron',
-            'net_segment_type': 'gre',
+            'net_segment_type': settings.NEUTRON_SEGMENT['tun'],
             'tenant': 'heatHA',
             'user': 'heatHA',
             'password': 'heatHA'
@@ -992,21 +942,16 @@ class HeatHA(TestBasic):
         cluster_vip = self.fuel_web.get_public_vip(cluster_id)
         os_conn = os_actions.OpenStackActions(
             cluster_vip, data['user'], data['password'], data['tenant'])
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=13, networks_count=2, timeout=300)
+        self.fuel_web.assert_cluster_ready(os_conn, smiles_count=13)
 
         for slave in ["slave-01", "slave-02", "slave-03"]:
             _ip = self.fuel_web.get_nailgun_node_by_name(slave)['ip']
-            checkers.verify_service(
-                self.env.d_env.get_ssh_to_remote(_ip),
-                service_name='heat-api', count=3)
+            checkers.verify_service(_ip, service_name='heat-api', count=5)
+            checkers.verify_service(_ip,
+                                    service_name='ceilometer-api',
+                                    ignore_count_of_proccesses=True)
 
-            _ip = self.fuel_web.get_nailgun_node_by_name(slave)['ip']
-            checkers.verify_service(
-                self.env.d_env.get_ssh_to_remote(_ip),
-                service_name='ceilometer-api')
-
-        LOGGER.debug('Run Heat OSTF platform tests')
+        logger.debug('Run Heat OSTF platform tests')
 
         test_class_main = ('fuel_health.tests.tests_platform.'
                            'test_heat.'

@@ -12,36 +12,36 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import os
+from __future__ import division
+from __future__ import unicode_literals
+
 import re
+from warnings import warn
 
-from devops.helpers.helpers import wait
 from proboscis.asserts import assert_equal
-from proboscis.asserts import assert_false
 from proboscis.asserts import assert_true
-from proboscis import SkipTest
 from proboscis import test
+from proboscis import SkipTest
 
-from fuelweb_test.helpers import checkers
-from devops.helpers.helpers import tcp_ping
 from fuelweb_test.helpers.decorators import log_snapshot_after_test
 from fuelweb_test.helpers.eb_tables import Ebtables
 from fuelweb_test.helpers import os_actions
-from fuelweb_test.settings import CLASSIC_PROVISIONING
 from fuelweb_test.settings import DEPLOYMENT_MODE
+from fuelweb_test.settings import MIRROR_UBUNTU
 from fuelweb_test.settings import NODE_VOLUME_SIZE
-from fuelweb_test.settings import OPENSTACK_RELEASE
-from fuelweb_test.settings import OPENSTACK_RELEASE_UBUNTU
+from fuelweb_test.settings import NEUTRON_SEGMENT
+from fuelweb_test.settings import NEUTRON_SEGMENT_TYPE
+from fuelweb_test.settings import iface_alias
 from fuelweb_test.tests.base_test_case import SetupEnvironment
 from fuelweb_test.tests.base_test_case import TestBasic
 from fuelweb_test import logger
 from fuelweb_test.tests.test_ha_one_controller_base\
-    import HAOneControllerFlatBase
+    import HAOneControllerNeutronBase
 
 
-@test(groups=["thread_2"])
+@test()
 class OneNodeDeploy(TestBasic):
-    """OneNodeDeploy."""  # TODO documentation
+    """OneNodeDeploy. DEPRECATED!"""  # TODO documentation
 
     @test(depends_on=[SetupEnvironment.prepare_release],
           groups=["deploy_one_node", 'master'])
@@ -60,15 +60,15 @@ class OneNodeDeploy(TestBasic):
 
         """
         self.env.revert_snapshot("ready")
-        self.fuel_web.client.get_root()
+        self.fuel_web.client.list_nodes()
         self.env.bootstrap_nodes(
             self.env.d_env.nodes().slaves[:1])
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
-            mode=DEPLOYMENT_MODE
+            mode=DEPLOYMENT_MODE,
         )
-        logger.info('cluster is %s' % str(cluster_id))
+        logger.info('Cluster is {!s}'.format(cluster_id))
         self.fuel_web.update_nodes(
             cluster_id,
             {'slave-01': ['controller']}
@@ -76,24 +76,22 @@ class OneNodeDeploy(TestBasic):
         self.fuel_web.deploy_cluster_wait(cluster_id)
         os_conn = os_actions.OpenStackActions(
             self.fuel_web.get_public_vip(cluster_id))
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=4, networks_count=1, timeout=300)
+        self.fuel_web.assert_cluster_ready(os_conn, smiles_count=4)
         self.fuel_web.run_single_ostf_test(
             cluster_id=cluster_id, test_sets=['sanity'],
             test_name=('fuel_health.tests.sanity.test_sanity_identity'
                        '.SanityIdentityTest.test_list_users'))
 
 
-@test(groups=["thread_2"])
-class HAOneControllerFlat(HAOneControllerFlatBase):
-    """HAOneControllerFlat."""  # TODO documentation
+@test(groups=["one_controller_actions"])
+class HAOneControllerNeutron(HAOneControllerNeutronBase):
+    """HAOneControllerNeutron."""  # TODO documentation
 
     @test(depends_on=[SetupEnvironment.prepare_slaves_3],
-          groups=["smoke", "deploy_ha_one_controller_flat",
-                  "ha_one_controller_nova_flat", "smoke_nova"])
+          groups=["smoke", "deploy_ha_one_controller_neutron"])
     @log_snapshot_after_test
-    def deploy_ha_one_controller_flat(self):
-        """Deploy cluster in HA mode (one controller) with flat nova-network
+    def deploy_ha_one_controller_neutron(self):
+        """Deploy cluster in HA mode (one controller) with neutron
 
         Scenario:
             1. Create cluster in HA mode
@@ -107,56 +105,19 @@ class HAOneControllerFlat(HAOneControllerFlatBase):
             8. Run OSTF
 
         Duration 30m
-        Snapshot: deploy_ha_one_controller_flat
+        Snapshot: deploy_ha_one_controller_neutron
         """
-        super(self.__class__, self).deploy_ha_one_controller_flat_base()
+        super(self.__class__, self).deploy_ha_one_controller_neutron_base(
+            snapshot_name="deploy_ha_one_controller_neutron")
 
-    @test(enabled=False, depends_on=[deploy_ha_one_controller_flat],
-          groups=["ha_one_controller_flat_create_instance"])
+    @test(depends_on=[deploy_ha_one_controller_neutron],
+          groups=["ha_one_controller_neutron_node_deletion"])
     @log_snapshot_after_test
-    def ha_one_controller_flat_create_instance(self):
-        """Create instance with file injection
+    def ha_one_controller_neutron_node_deletion(self):
+        """Remove compute from cluster in ha mode with neutron
 
          Scenario:
-            1. Revert "ha one controller flat" environment
-            2. Create instance with file injection
-            3. Assert instance was created
-            4. Assert file is on instance
-
-        Duration 20m
-
-        """
-        self.env.revert_snapshot("deploy_ha_one_controller_flat")
-        data = {
-            'tenant': 'novaSimpleFlat',
-            'user': 'novaSimpleFlat',
-            'password': 'novaSimpleFlat'
-        }
-        cluster_id = self.fuel_web.get_last_created_cluster()
-        os = os_actions.OpenStackActions(
-            self.fuel_web.get_public_vip(cluster_id),
-            data['user'], data['password'], data['tenant'])
-
-        _ip = self.fuel_web.get_nailgun_node_by_name("slave-01")['ip']
-        remote = self.env.d_env.get_ssh_to_remote(_ip)
-        remote.execute("echo 'Hello World' > /root/test.txt")
-        server_files = {"/root/test.txt": 'Hello World'}
-        instance = os.create_server_for_migration(file=server_files)
-        floating_ip = os.assign_floating_ip(instance)
-        wait(lambda: tcp_ping(floating_ip.ip, 22), timeout=120)
-        res = os.execute_through_host(
-            remote,
-            floating_ip.ip, "sudo cat /root/test.txt")
-        assert_true(res == 'Hello World', 'file content is {0}'.format(res))
-
-    @test(depends_on=[deploy_ha_one_controller_flat],
-          groups=["ha_one_controller_flat_node_deletion"])
-    @log_snapshot_after_test
-    def ha_one_controller_flat_node_deletion(self):
-        """Remove compute from cluster in ha mode with flat nova-network
-
-         Scenario:
-            1. Revert "deploy_ha_one_controller_flat" environment
+            1. Revert "deploy_ha_one_controller_neutron" environment
             2. Remove compute node
             3. Deploy changes
             4. Verify node returns to unallocated pull
@@ -164,26 +125,24 @@ class HAOneControllerFlat(HAOneControllerFlatBase):
         Duration 8m
 
         """
-        self.env.revert_snapshot("deploy_ha_one_controller_flat")
+        self.env.revert_snapshot("deploy_ha_one_controller_neutron")
 
         cluster_id = self.fuel_web.get_last_created_cluster()
         nailgun_nodes = self.fuel_web.update_nodes(
             cluster_id, {'slave-02': ['compute']}, False, True)
         task = self.fuel_web.deploy_cluster(cluster_id)
         self.fuel_web.assert_task_success(task)
-        nodes = filter(lambda x: x["pending_deletion"] is True, nailgun_nodes)
+        nodes = [
+            node for node in nailgun_nodes if node["pending_deletion"] is True]
         assert_true(
             len(nodes) == 1, "Verify 1 node has pending deletion status"
         )
-        wait(
-            lambda: self.fuel_web.is_node_discovered(nodes[0]),
-            timeout=10 * 60
-        )
+        self.fuel_web.wait_node_is_discovered(nodes[0])
 
     @test(depends_on=[SetupEnvironment.prepare_slaves_3],
-          groups=["ha_one_controller_flat_blocked_vlan"])
+          groups=["ha_one_controller_neutron_blocked_vlan"])
     @log_snapshot_after_test
-    def ha_one_controller_flat_blocked_vlan(self):
+    def ha_one_controller_neutron_blocked_vlan(self):
         """Verify network verification with blocked VLANs
 
         Scenario:
@@ -204,7 +163,11 @@ class HAOneControllerFlat(HAOneControllerFlatBase):
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
-            mode=DEPLOYMENT_MODE
+            mode=DEPLOYMENT_MODE,
+            settings={
+                "net_provider": 'neutron',
+                "net_segment_type": NEUTRON_SEGMENT['vlan']
+            }
         )
         self.fuel_web.update_nodes(
             cluster_id,
@@ -214,11 +177,10 @@ class HAOneControllerFlat(HAOneControllerFlatBase):
             }
         )
         self.fuel_web.deploy_cluster_wait(cluster_id)
+
         os_conn = os_actions.OpenStackActions(
             self.fuel_web.get_public_vip(cluster_id))
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=6, networks_count=1, timeout=300)
-
+        self.fuel_web.assert_cluster_ready(os_conn, smiles_count=5)
         ebtables = self.env.get_ebtables(
             cluster_id, self.env.d_env.nodes().slaves[:2])
         ebtables.restore_vlans()
@@ -229,9 +191,9 @@ class HAOneControllerFlat(HAOneControllerFlatBase):
             ebtables.restore_first_vlan()
 
     @test(depends_on=[SetupEnvironment.prepare_slaves_3],
-          groups=["ha_one_controller_flat_add_compute"])
+          groups=["ha_one_controller_neutron_add_compute"])
     @log_snapshot_after_test
-    def ha_one_controller_flat_add_compute(self):
+    def ha_one_controller_neutron_add_compute(self):
         """Add compute node to cluster in ha mode
 
         Scenario:
@@ -249,15 +211,14 @@ class HAOneControllerFlat(HAOneControllerFlatBase):
             10. Run OSTF
 
         Duration 40m
-        Snapshot: ha_one_controller_flat_add_compute
+        Snapshot: ha_one_controller_neutron_add_compute
         """
         self.env.revert_snapshot("ready_with_3_slaves")
 
         data = {
-            'tenant': 'flatAddCompute',
-            'user': 'flatAddCompute',
-            'password': 'flatAddCompute'
-
+            'tenant': 'neutronAddCompute',
+            'user': 'neutronAddCompute',
+            'password': 'neutronAddCompute',
         }
 
         cluster_id = self.fuel_web.create_cluster(
@@ -273,100 +234,34 @@ class HAOneControllerFlat(HAOneControllerFlatBase):
             }
         )
         self.fuel_web.deploy_cluster_wait(cluster_id)
+
         os_conn = os_actions.OpenStackActions(
             self.fuel_web.get_public_vip(cluster_id),
             data['user'], data['password'], data['tenant'])
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=6, networks_count=1, timeout=300)
+        self.fuel_web.assert_cluster_ready(os_conn, smiles_count=5)
 
         self.fuel_web.update_nodes(
             cluster_id, {'slave-03': ['compute']}, True, False)
         self.fuel_web.deploy_cluster_wait(cluster_id)
 
+        self.fuel_web.assert_cluster_ready(os_conn, smiles_count=6)
+
         assert_equal(
             3, len(self.fuel_web.client.list_cluster_nodes(cluster_id)))
 
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=8, networks_count=1, timeout=300)
-
         self.fuel_web.run_ostf(
             cluster_id=cluster_id)
 
-        self.env.make_snapshot("ha_one_controller_flat_add_compute")
+        self.env.make_snapshot("ha_one_controller_neutron_add_compute")
 
-
-@test(groups=["thread_2"])
-class HAOneControllerVlan(TestBasic):
-    """HAOneControllerVlan."""  # TODO documentation
-
-    @test(depends_on=[SetupEnvironment.prepare_slaves_3],
-          groups=["deploy_ha_one_controller_vlan",
-                  "ha_one_controller_nova_vlan"])
-    @log_snapshot_after_test
-    def deploy_ha_one_controller_vlan(self):
-        """Deploy cluster in ha mode with nova-network VLAN Manager
-
-        Scenario:
-            1. Create cluster in Ha mode
-            2. Add 1 node with controller role
-            3. Add 1 node with compute role
-            4. Set up cluster to use Network VLAN manager with 8 networks
-            5. Deploy the cluster
-            6. Validate cluster was set up correctly, there are no dead
-               services, there are no errors in logs
-            7. Run network verification
-            8. Run OSTF
-
-        Duration 30m
-        Snapshot: deploy_ha_one_controller_vlan
-        """
-        self.env.revert_snapshot("ready_with_3_slaves")
-
-        data = {
-            'tenant': 'novaSimpleVlan',
-            'user': 'novaSimpleVlan',
-            'password': 'novaSimpleVlan'
-        }
-
-        cluster_id = self.fuel_web.create_cluster(
-            name=self.__class__.__name__,
-            mode=DEPLOYMENT_MODE,
-            settings=data
-        )
-        self.fuel_web.update_nodes(
-            cluster_id,
-            {
-                'slave-01': ['controller'],
-                'slave-02': ['compute']
-            }
-        )
-
-        self.fuel_web.update_vlan_network_fixed(
-            cluster_id, amount=8, network_size=32)
-        self.fuel_web.deploy_cluster_wait(cluster_id)
-
-        os_conn = os_actions.OpenStackActions(
-            self.fuel_web.get_public_vip(cluster_id),
-            data['user'], data['password'], data['tenant'])
-
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=6, networks_count=8, timeout=300)
-
-        self.fuel_web.verify_network(cluster_id)
-
-        self.fuel_web.run_ostf(
-            cluster_id=cluster_id)
-
-        self.env.make_snapshot("deploy_ha_one_controller_vlan", is_make=True)
-
-    @test(depends_on=[deploy_ha_one_controller_vlan],
+    @test(depends_on=[deploy_ha_one_controller_neutron],
           groups=["deploy_base_os_node"])
     @log_snapshot_after_test
     def deploy_base_os_node(self):
         """Add base-os node to cluster in HA mode with one controller
 
         Scenario:
-            1. Revert snapshot "deploy_ha_one_controller_vlan"
+            1. Revert snapshot "deploy_ha_one_controller_neutron"
             2. Add 1 node with base-os role
             3. Deploy the cluster
             4. Run network verification
@@ -377,7 +272,7 @@ class HAOneControllerVlan(TestBasic):
         Snapshot: deploy_base_os_node
 
         """
-        self.env.revert_snapshot("deploy_ha_one_controller_vlan")
+        self.env.revert_snapshot("deploy_ha_one_controller_neutron")
 
         cluster_id = self.fuel_web.get_last_created_cluster()
 
@@ -393,17 +288,44 @@ class HAOneControllerVlan(TestBasic):
         self.fuel_web.run_ostf(cluster_id=cluster_id)
 
         _ip = self.fuel_web.get_nailgun_node_by_name("slave-03")['ip']
-        remote = self.env.d_env.get_ssh_to_remote(_ip)
-
-        result = remote.execute('readlink /etc/astute.yaml')['stdout']
-
-        assert_true("base-os" in result[0],
-                    "Role mismatch. Node slave-03 is not base-os")
+        result = self.ssh_manager.check_call(
+            command='hiera roles', ip=_ip).stdout_str
+        assert_equal(
+            '["base-os"]',
+            result,
+            message="Role mismatch. Node slave-03 is not base-os")
 
         self.env.make_snapshot("deploy_base_os_node")
 
+    @test(depends_on=[deploy_ha_one_controller_neutron],
+          groups=["delete_environment"])
+    @log_snapshot_after_test
+    def delete_environment(self):
+        """Delete existing environment
+        and verify nodes returns to unallocated state
 
-@test(groups=["thread_2", "multirole"])
+        Scenario:
+            1. Revert "deploy_ha_one_controller" environment
+            2. Delete environment
+            3. Verify node returns to unallocated pull
+
+        Duration 15m
+        """
+        self.env.revert_snapshot("deploy_ha_one_controller_neutron")
+
+        cluster_id = self.fuel_web.get_last_created_cluster()
+        self.fuel_web.client.delete_cluster(cluster_id)
+        nailgun_nodes = self.fuel_web.client.list_nodes()
+        nodes = [
+            node for node in nailgun_nodes if node["pending_deletion"] is True]
+        assert_true(
+            len(nodes) == 2, "Verify 2 node has pending deletion status"
+        )
+        self.fuel_web.wait_node_is_discovered(nodes[0])
+        self.fuel_web.wait_node_is_discovered(nodes[1])
+
+
+@test(groups=["multirole"])
 class MultiroleControllerCinder(TestBasic):
     """MultiroleControllerCinder."""  # TODO documentation
 
@@ -430,7 +352,7 @@ class MultiroleControllerCinder(TestBasic):
         data = {
             'tenant': 'multirolecinder',
             'user': 'multirolecinder',
-            'password': 'multirolecinder'
+            'password': 'multirolecinder',
         }
 
         cluster_id = self.fuel_web.create_cluster(
@@ -454,7 +376,7 @@ class MultiroleControllerCinder(TestBasic):
         self.env.make_snapshot("deploy_multirole_controller_cinder")
 
 
-@test(groups=["thread_2", "multirole"])
+@test(groups=["multirole"])
 class MultiroleComputeCinder(TestBasic):
     """MultiroleComputeCinder."""  # TODO documentation
 
@@ -480,7 +402,7 @@ class MultiroleComputeCinder(TestBasic):
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
-            mode=DEPLOYMENT_MODE
+            mode=DEPLOYMENT_MODE,
         )
         self.fuel_web.update_nodes(
             cluster_id,
@@ -499,7 +421,99 @@ class MultiroleComputeCinder(TestBasic):
         self.env.make_snapshot("deploy_multirole_compute_cinder")
 
 
-@test(groups=["thread_2"])
+@test(groups=["multirole"])
+class MultiroleMultipleServices(TestBasic):
+    """MultiroleMultipleServices."""  # TODO documentation
+
+    @test(depends_on=[SetupEnvironment.prepare_slaves_5],
+          groups=["deploy_multiple_services_local_mirror"])
+    @log_snapshot_after_test
+    def deploy_multiple_services_local_mirror(self):
+        """Deploy cluster with multiple services using local mirror
+
+        Scenario:
+            1. Revert snapshot 'prepare_slaves_5' with default set of mirrors
+            2. Run 'fuel-mirror' to create mirror repositories
+            3. Create cluster with many components to check as many
+               packages in local mirrors have correct dependencies
+            4. Run 'fuel-mirror' to replace cluster repositories
+               with local mirrors
+            5. Check that repositories are changed
+            6. Deploy cluster
+            7. Check running services with OSTF
+
+        Duration 140m
+        """
+        self.show_step(1)
+        self.env.revert_snapshot('ready_with_5_slaves')
+
+        self.show_step(2)
+        admin_ip = self.ssh_manager.admin_ip
+        if MIRROR_UBUNTU != '':
+            ubuntu_url = MIRROR_UBUNTU.split()[1]
+            replace_cmd = \
+                "sed -i 's,http://archive.ubuntu.com/ubuntu,{0},g'" \
+                " /usr/share/fuel-mirror/ubuntu.yaml".format(
+                    ubuntu_url)
+            self.ssh_manager.check_call(ip=admin_ip, command=replace_cmd)
+
+        create_mirror_cmd = 'fuel-mirror create -P ubuntu -G mos ubuntu'
+        self.env.admin_actions.ensure_cmd(create_mirror_cmd)
+
+        self.show_step(3)
+        cluster_id = self.fuel_web.create_cluster(
+            name=self.__class__.__name__,
+            mode=DEPLOYMENT_MODE,
+            settings={
+                'net_provider': 'neutron',
+                'net_segment_type': NEUTRON_SEGMENT['tun'],
+                'sahara': True,
+                'murano': True,
+                'ceilometer': True,
+                'volumes_lvm': True,
+                'volumes_ceph': False,
+                'images_ceph': True
+            }
+        )
+
+        self.show_step(4)
+        apply_mirror_cmd = 'fuel-mirror apply -P ubuntu -G mos ubuntu ' \
+                           '--env {0} --replace'.format(cluster_id)
+        self.ssh_manager.check_call(ip=admin_ip, command=apply_mirror_cmd)
+
+        self.fuel_web.update_nodes(
+            cluster_id,
+            {
+                'slave-01': ['controller', 'ceph-osd'],
+                'slave-02': ['compute', 'ceph-osd'],
+                'slave-03': ['cinder', 'ceph-osd'],
+                'slave-04': ['mongo'],
+                'slave-05': ['mongo']
+            }
+        )
+
+        self.show_step(5)
+        repos_ubuntu = self.fuel_web.get_cluster_repos(cluster_id)
+        remote_repos = []
+        for repo_value in repos_ubuntu['value']:
+            if (self.fuel_web.admin_node_ip not in repo_value['uri'] and
+                    '{settings.MASTER_IP}' not in repo_value['uri']):
+                remote_repos.append({repo_value['name']: repo_value['uri']})
+        assert_true(not remote_repos,
+                    "Some repositories weren't replaced with local mirrors: "
+                    "{0}".format(remote_repos))
+
+        self.fuel_web.verify_network(cluster_id)
+        self.show_step(6)
+        self.fuel_web.deploy_cluster_wait(cluster_id)
+
+        self.show_step(7)
+        self.fuel_web.run_ostf(
+            cluster_id=cluster_id,
+            test_sets=['ha', 'smoke', 'sanity'])
+
+
+@test
 class FloatingIPs(TestBasic):
     """FloatingIPs."""  # TODO documentation
 
@@ -507,13 +521,13 @@ class FloatingIPs(TestBasic):
           groups=["deploy_floating_ips"])
     @log_snapshot_after_test
     def deploy_floating_ips(self):
-        """Deploy cluster with non-default 3 floating IPs ranges
+        """Deploy cluster with non-default 1 floating IPs ranges
 
         Scenario:
-            1. Create cluster in Ha mode
+            1. Create cluster in HA mode
             2. Add 1 node with controller role
             3. Add 1 node with compute and cinder roles
-            4. Update floating IP ranges. Use 3 ranges
+            4. Update floating IP ranges. Use 1 range
             5. Deploy the cluster
             6. Verify available floating IP list
             7. Run OSTF
@@ -522,16 +536,21 @@ class FloatingIPs(TestBasic):
         Snapshot: deploy_floating_ips
 
         """
+        # Test should be re-worked for neutron according to LP#1481322
         self.env.revert_snapshot("ready_with_3_slaves")
+
+        csettings = {
+            'tenant': 'floatingip',
+            'user': 'floatingip',
+            'password': 'floatingip',
+            'net_provider': 'neutron',
+            'net_segment_type': NEUTRON_SEGMENT_TYPE,
+        }
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
             mode=DEPLOYMENT_MODE,
-            settings={
-                'tenant': 'floatingip',
-                'user': 'floatingip',
-                'password': 'floatingip'
-            }
+            settings=csettings,
         )
         self.fuel_web.update_nodes(
             cluster_id,
@@ -541,8 +560,9 @@ class FloatingIPs(TestBasic):
             }
         )
 
+        floating_list = [self.fuel_web.get_floating_ranges()[0][0]]
         networking_parameters = {
-            "floating_ranges": self.fuel_web.get_floating_ranges()[0]}
+            "floating_ranges": floating_list}
 
         self.fuel_web.client.update_network(
             cluster_id,
@@ -551,81 +571,38 @@ class FloatingIPs(TestBasic):
 
         self.fuel_web.deploy_cluster_wait(cluster_id)
 
-        # assert ips
-        expected_ips = self.fuel_web.get_floating_ranges()[1]
-        self.fuel_web.assert_cluster_floating_list('slave-02', expected_ips)
+        os_conn = os_actions.OpenStackActions(
+            self.fuel_web.get_public_vip(cluster_id),
+            user=csettings['user'],
+            passwd=csettings['password'],
+            tenant=csettings['tenant'])
 
-        self.fuel_web.run_ostf(
-            cluster_id=cluster_id)
+        # assert ips
+        expected_ips = self.fuel_web.get_floating_ranges()[1][0]
+        self.fuel_web.assert_cluster_floating_list(
+            os_conn, cluster_id, expected_ips)
+
+        self.fuel_web.run_ostf(cluster_id=cluster_id)
 
         self.env.make_snapshot("deploy_floating_ips")
 
 
-@test(groups=["ha_one_controller"])
-class HAOneControllerCinder(TestBasic):
-    """HAOneControllerCinder."""  # TODO documentation
-
-    @test(depends_on=[SetupEnvironment.prepare_slaves_3],
-          groups=["deploy_ha_one_controller_cinder",
-                  "ha_one_controller_nova_cinder"])
-    @log_snapshot_after_test
-    def deploy_ha_one_controller_cinder(self):
-        """Deploy cluster in HA mode with cinder
-
-        Scenario:
-            1. Create cluster in Ha mode
-            2. Add 1 node with controller role
-            3. Add 1 node with compute role
-            4. Add 1 node with cinder role
-            5. Deploy the cluster
-            6. Validate cluster was set up correctly, there are no dead
-               services, there are no errors in logs
-            7. Run OSTF
-
-        Duration 30m
-        Snapshot: deploy_ha_one_controller_cinder
-        """
-        self.env.revert_snapshot("ready_with_3_slaves")
-
-        cluster_id = self.fuel_web.create_cluster(
-            name=self.__class__.__name__,
-            mode=DEPLOYMENT_MODE
-        )
-        self.fuel_web.update_nodes(
-            cluster_id,
-            {
-                'slave-01': ['controller'],
-                'slave-02': ['compute'],
-                'slave-03': ['cinder']
-            }
-        )
-        self.fuel_web.deploy_cluster_wait(cluster_id)
-
-        os_conn = os_actions.OpenStackActions(
-            self.fuel_web.get_public_vip(cluster_id))
-
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=6, networks_count=1, timeout=300)
-
-        self.fuel_web.check_fixed_network_cidr(
-            cluster_id, os_conn)
-        self.fuel_web.verify_network(cluster_id)
-        self.env.verify_network_configuration("slave-01")
-
-        self.fuel_web.run_ostf(cluster_id=cluster_id)
-
-        self.env.make_snapshot("deploy_ha_one_controller_cinder")
-
-
-@test(groups=["thread_1"])
+@test(enabled=False, groups=["thread_1"])
 class NodeMultipleInterfaces(TestBasic):
-    """NodeMultipleInterfaces."""  # TODO documentation
+    """NodeMultipleInterfaces.
+
+    Test disabled and move to fuel_tests suite:
+        fuel_tests.test.test_l2_network_config
+    """  # TODO documentation
 
     @test(depends_on=[SetupEnvironment.prepare_slaves_3],
           groups=["deploy_node_multiple_interfaces"])
     @log_snapshot_after_test
     def deploy_node_multiple_interfaces(self):
         """Deploy cluster with networks allocated on different interfaces
+
+        Test disabled and move to fuel_tests suite:
+            fuel_tests.test.test_l2_network_config.TestL2NetworkConfig
 
         Scenario:
             1. Create cluster in Ha mode
@@ -641,18 +618,23 @@ class NodeMultipleInterfaces(TestBasic):
         Snapshot: deploy_node_multiple_interfaces
 
         """
+        # pylint: disable=W0101
+        warn("Test disabled and move to fuel_tests suite", DeprecationWarning)
+        raise SkipTest("Test disabled and move to fuel_tests suite")
+
         self.env.revert_snapshot("ready_with_3_slaves")
 
         interfaces_dict = {
-            'eth1': ['public'],
-            'eth2': ['storage'],
-            'eth3': ['fixed'],
-            'eth4': ['management'],
+            iface_alias('eth0'): ['fuelweb_admin'],
+            iface_alias('eth1'): ['public'],
+            iface_alias('eth2'): ['storage'],
+            iface_alias('eth3'): ['private'],
+            iface_alias('eth4'): ['management'],
         }
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
-            mode=DEPLOYMENT_MODE
+            mode=DEPLOYMENT_MODE,
         )
         self.fuel_web.update_nodes(
             cluster_id,
@@ -667,23 +649,29 @@ class NodeMultipleInterfaces(TestBasic):
             self.fuel_web.update_node_networks(node['id'], interfaces_dict)
 
         self.fuel_web.deploy_cluster_wait(cluster_id)
-        for node in ['slave-01', 'slave-02', 'slave-03']:
-            self.env.verify_network_configuration(node)
 
         self.fuel_web.verify_network(cluster_id)
 
         self.env.make_snapshot("deploy_node_multiple_interfaces", is_make=True)
 
 
-@test(groups=["thread_1"])
+@test(enabled=False, groups=["thread_1"])
 class NodeDiskSizes(TestBasic):
-    """NodeDiskSizes."""  # TODO documentation
+    """NodeDiskSizes.
 
-    @test(depends_on=[SetupEnvironment.prepare_slaves_3],
+    Test disabled and move to fuel_tests suite:
+        fuel_tests.test.test_discovery_slave
+
+    """  # TODO documentation
+
+    @test(enabled=False, depends_on=[SetupEnvironment.prepare_slaves_3],
           groups=["check_nodes_notifications"])
     @log_snapshot_after_test
     def check_nodes_notifications(self):
         """Verify nailgun notifications for discovered nodes
+
+        Test disabled and move to fuel_tests suite:
+            fuel_tests.test.test_discovery_slave.TestNodeDiskSizes
 
         Scenario:
             1. Revert snapshot "ready_with_3_slaves"
@@ -693,6 +681,10 @@ class NodeDiskSizes(TestBasic):
         Duration 5m
 
         """
+        # pylint: disable=W0101
+        warn("Test disabled and move to fuel_tests suite", DeprecationWarning)
+        raise SkipTest("Test disabled and move to fuel_tests suite")
+
         self.env.revert_snapshot("ready_with_3_slaves")
 
         # assert /api/nodes
@@ -702,8 +694,9 @@ class NodeDiskSizes(TestBasic):
             for disk in node['meta']['disks']:
                 assert_equal(disk['size'], disk_size, 'Disk size')
 
-        hdd_size = "{} TB HDD".format(float(disk_size * 3 / (10 ** 9)) / 1000)
+        hdd_size = "{0:.3} TB HDD".format((disk_size * 3 / (10 ** 9)) / 1000)
         notifications = self.fuel_web.client.get_notifications()
+
         for node in nailgun_nodes:
             # assert /api/notifications
             for notification in notifications:
@@ -711,19 +704,34 @@ class NodeDiskSizes(TestBasic):
                 current_node = notification['node_id'] == node['id']
                 if current_node and discover and \
                    "discovered" in notification['message']:
-                    assert_true(hdd_size in notification['message'])
+                    assert_true(hdd_size in notification['message'],
+                                '"{size} not found in notification message '
+                                '"{note}" for node {node} '
+                                '(hostname {host})!'.format(
+                                    size=hdd_size,
+                                    note=notification['message'],
+                                    node=node['name'],
+                                    host=node['hostname'])
+                                )
 
             # assert disks
             disks = self.fuel_web.client.get_node_disks(node['id'])
             for disk in disks:
-                assert_equal(disk['size'],
-                             NODE_VOLUME_SIZE * 1024 - 500, 'Disk size')
+                assert_equal(
+                    disk['size'], NODE_VOLUME_SIZE * 1024 - 500,
+                    'Disk size {0} is not equals expected {1}'.format(
+                        disk['size'], NODE_VOLUME_SIZE * 1024 - 500
+                    ))
 
-    @test(depends_on=[NodeMultipleInterfaces.deploy_node_multiple_interfaces],
+    @test(enabled=False,
+          depends_on=[NodeMultipleInterfaces.deploy_node_multiple_interfaces],
           groups=["check_nodes_disks"])
     @log_snapshot_after_test
     def check_nodes_disks(self):
         """Verify hard drive sizes for deployed nodes
+
+        Test disabled and move to fuel_tests suite:
+            fuel_tests.test.test_discovery_slave.TestNodeDiskSizes
 
         Scenario:
             1. Revert snapshot "deploy_node_multiple_interfaces"
@@ -731,6 +739,9 @@ class NodeDiskSizes(TestBasic):
 
         Duration 15m
         """
+        # pylint: disable=W0101
+        warn("Test disabled and move to fuel_tests suite", DeprecationWarning)
+        raise SkipTest("Test disabled and move to fuel_tests suite")
 
         self.env.revert_snapshot("deploy_node_multiple_interfaces")
 
@@ -772,15 +783,24 @@ class NodeDiskSizes(TestBasic):
                 ))
 
 
-@test(groups=["thread_1"])
+@test(enabled=False, groups=["thread_1"])
 class MultinicBootstrap(TestBasic):
-    """MultinicBootstrap."""  # TODO documentation
+    """MultinicBootstrap.
 
-    @test(depends_on=[SetupEnvironment.prepare_release],
+    Test disabled and move to fuel_tests suite:
+        fuel_tests.test.test_discovery_slave
+
+    """  # TODO documentation
+
+    @test(enabled=False,
+          depends_on=[SetupEnvironment.prepare_release],
           groups=["multinic_bootstrap_booting"])
     @log_snapshot_after_test
     def multinic_bootstrap_booting(self):
         """Verify slaves booting with blocked mac address
+
+        Test disabled and move to fuel_tests suite:
+            fuel_tests.test.test_discovery_slave.TestMultinicBootstrap
 
         Scenario:
             1. Revert snapshot "ready"
@@ -791,6 +811,10 @@ class MultinicBootstrap(TestBasic):
         Duration 2m
 
         """
+        # pylint: disable=W0101
+        warn("Test disabled and move to fuel_tests suite", DeprecationWarning)
+        raise SkipTest("Test disabled and move to fuel_tests suite")
+
         self.env.revert_snapshot("ready")
 
         slave = self.env.d_env.nodes().slaves[0]
@@ -801,7 +825,7 @@ class MultinicBootstrap(TestBasic):
                 Ebtables.block_mac(mac)
             for mac in mac_addresses:
                 Ebtables.restore_mac(mac)
-                slave.destroy(verbose=False)
+                slave.destroy()
                 self.env.d_env.nodes().admins[0].revert("ready")
                 nailgun_slave = self.env.bootstrap_nodes([slave])[0]
                 assert_equal(mac.upper(), nailgun_slave['mac'].upper())
@@ -811,46 +835,14 @@ class MultinicBootstrap(TestBasic):
                 Ebtables.restore_mac(mac)
 
 
-@test(groups=["thread_2", "test"])
-class DeleteEnvironment(TestBasic):
-    """DeleteEnvironment."""  # TODO documentation
-
-    @test(depends_on=[HAOneControllerFlat.deploy_ha_one_controller_flat],
-          groups=["delete_environment"])
-    @log_snapshot_after_test
-    def delete_environment(self):
-        """Delete existing environment
-        and verify nodes returns to unallocated state
-
-        Scenario:
-            1. Revert "deploy_ha_one_controller" environment
-            2. Delete environment
-            3. Verify node returns to unallocated pull
-
-        Duration 15m
-
-        """
-        self.env.revert_snapshot("deploy_ha_one_controller_flat")
-
-        cluster_id = self.fuel_web.get_last_created_cluster()
-        self.fuel_web.client.delete_cluster(cluster_id)
-        nailgun_nodes = self.fuel_web.client.list_nodes()
-        nodes = filter(lambda x: x["pending_deletion"] is True, nailgun_nodes)
-        assert_true(
-            len(nodes) == 2, "Verify 2 node has pending deletion status"
-        )
-        wait(
-            lambda:
-            self.fuel_web.is_node_discovered(nodes[0]) and
-            self.fuel_web.is_node_discovered(nodes[1]),
-            timeout=10 * 60,
-            interval=15
-        )
-
-
-@test(groups=["thread_1"])
+@test(enabled=False, groups=["thread_1"])
 class UntaggedNetworksNegative(TestBasic):
-    """UntaggedNetworksNegative."""  # TODO documentation
+    """UntaggedNetworksNegative.
+
+    Test disabled and move to fuel_tests suite:
+        fuel_tests.test.test_l2_network_config.TestL2NetworkConfig
+
+    """  # TODO documentation
 
     @test(
         depends_on=[SetupEnvironment.prepare_slaves_3],
@@ -859,6 +851,9 @@ class UntaggedNetworksNegative(TestBasic):
     @log_snapshot_after_test
     def untagged_networks_negative(self):
         """Verify network verification fails with untagged network on eth0
+
+        Test disabled and move to fuel_tests suite:
+            fuel_tests.test.test_l2_network_config.TestL2NetworkConfig
 
         Scenario:
             1. Create cluster in ha mode
@@ -872,14 +867,18 @@ class UntaggedNetworksNegative(TestBasic):
         Duration 30m
 
         """
+        # pylint: disable=W0101
+        warn("Test disabled and move to fuel_tests suite", DeprecationWarning)
+        raise SkipTest("Test disabled and move to fuel_tests suite")
+
         self.env.revert_snapshot("ready_with_3_slaves")
 
         vlan_turn_off = {'vlan_start': None}
         interfaces = {
-            'eth0': ["fixed"],
-            'eth1': ["public"],
-            'eth2': ["management", "storage"],
-            'eth3': []
+            iface_alias('eth0'): ["fixed"],
+            iface_alias('eth1'): ["public"],
+            iface_alias('eth2'): ["management", "storage"],
+            iface_alias('eth3'): []
         }
 
         cluster_id = self.fuel_web.create_cluster(
@@ -900,7 +899,8 @@ class UntaggedNetworksNegative(TestBasic):
             self.fuel_web.update_node_networks(node['id'], interfaces)
 
         # select networks that will be untagged:
-        [net.update(vlan_turn_off) for net in nets]
+        for net in nets:
+            net.update(vlan_turn_off)
 
         # stop using VLANs:
         self.fuel_web.client.update_network(cluster_id, networks=nets)
@@ -913,76 +913,14 @@ class UntaggedNetworksNegative(TestBasic):
         self.fuel_web.assert_task_failed(task)
 
 
-@test(groups=["known_issues"])
-class BackupRestoreHAOneController(TestBasic):
-    """BackupRestoreHAOneController"""  # TODO documentation
-
-    @test(depends_on=[HAOneControllerFlat.deploy_ha_one_controller_flat],
-          groups=["ha_one_controller_backup_restore"])
-    @log_snapshot_after_test
-    def ha_one_controller_backup_restore(self):
-        """Backup/restore master node with one controller in cluster
-
-        Scenario:
-            1. Revert snapshot "deploy_ha_one_controller_flat"
-            2. Backup master
-            3. Check backup
-            4. Run OSTF
-            5. Add 1 node with compute role
-            6. Restore master
-            7. Check restore
-            8. Run OSTF
-
-        Duration 35m
-
-        """
-        self.env.revert_snapshot("deploy_ha_one_controller_flat")
-
-        cluster_id = self.fuel_web.get_last_created_cluster()
-        os_conn = os_actions.OpenStackActions(
-            self.fuel_web.get_public_vip(cluster_id),
-            'novaSimpleFlat', 'novaSimpleFlat', 'novaSimpleFlat')
-        self.fuel_web.assert_cluster_ready(
-            os_conn, smiles_count=6, networks_count=1, timeout=300)
-        # Execute master node backup
-        self.fuel_web.backup_master(self.env.d_env.get_admin_remote())
-
-        # Check created backup
-        checkers.backup_check(self.env.d_env.get_admin_remote())
-
-        self.fuel_web.update_nodes(
-            cluster_id, {'slave-03': ['compute']}, True, False)
-
-        assert_equal(
-            3, len(self.fuel_web.client.list_cluster_nodes(cluster_id)))
-
-        self.fuel_web.restore_master(self.env.d_env.get_admin_remote())
-        checkers.restore_check_sum(self.env.d_env.get_admin_remote())
-        self.fuel_web.restore_check_nailgun_api(
-            self.env.d_env.get_admin_remote())
-        checkers.iptables_check(self.env.d_env.get_admin_remote())
-
-        assert_equal(
-            2, len(self.fuel_web.client.list_cluster_nodes(cluster_id)))
-
-        self.fuel_web.update_nodes(
-            cluster_id, {'slave-03': ['compute']}, True, False)
-        self.fuel_web.deploy_cluster_wait(cluster_id)
-
-        self.fuel_web.run_ostf(
-            cluster_id=cluster_id)
-
-        self.env.make_snapshot("ha_one_controller_backup_restore")
-
-
 @test(groups=["thread_usb"])
-class HAOneControllerFlatUSB(HAOneControllerFlatBase):
-    """HAOneControllerFlatUSB."""  # TODO documentation
+class HAOneControllerNeutronUSB(HAOneControllerNeutronBase):
+    """HAOneControllerNeutronUSB."""  # TODO documentation
 
     @test(depends_on=[SetupEnvironment.prepare_slaves_3])
     @log_snapshot_after_test
-    def deploy_ha_one_controller_flat_usb(self):
-        """Deploy cluster in HA mode (1 controller) with flat nova-network USB
+    def deploy_ha_one_controller_neutron_usb(self):
+        """Deploy cluster in HA mode (1 controller) with neutron USB
 
         Scenario:
             1. Create cluster in HA mode
@@ -996,74 +934,8 @@ class HAOneControllerFlatUSB(HAOneControllerFlatBase):
             8. Run OSTF
 
         Duration 30m
-        Snapshot: deploy_ha_one_controller_flat
+        Snapshot: deploy_ha_one_controller_neutron
         """
 
-        super(self.__class__, self).deploy_ha_one_controller_flat_base()
-
-
-@test(groups=["thread_usb", "classic_provisioning"])
-class ProvisioningScripts(TestBasic):
-
-    base_path = '/var/www/nailgun/ubuntu/x86_64/images/'
-    filenames = ['initrd.gz', 'linux']
-
-    def get_zero_length_files(self):
-        remote = self.env.d_env.get_admin_remote()
-
-        zero_length_files = []
-        for f_name in self.filenames:
-            file_size = checkers.get_file_size(remote, f_name, self.base_path)
-            if not file_size:
-                zero_length_files.append(f_name)
-            full_path = os.path.join(self.base_path, f_name)
-            logger.info("File %s has size %s", full_path, file_size)
-
-        return zero_length_files
-
-    @test(depends_on=[SetupEnvironment.prepare_release],
-          groups=["check_fuel_provisioning_scripts"])
-    @log_snapshot_after_test
-    def check_fuel_provisioning_scripts(self):
-        """Deploy cluster with controller node only
-
-        Scenario:
-            1. Deploy master node
-            2. Check sizes of the files
-            3. Create cluster
-            4. Add 1 node with controller role
-            5. Deploy the cluster
-            6. Check sizes of the files again
-
-        Duration 45m
-        """
-        if OPENSTACK_RELEASE_UBUNTU != OPENSTACK_RELEASE or \
-                not CLASSIC_PROVISIONING:
-            raise SkipTest()
-
-        self.env.revert_snapshot("ready")
-
-        zero_length_files = self.get_zero_length_files()
-        non_zero_length_files = list(
-            set(zero_length_files) - set(self.filenames))
-
-        error_msg = "Non zero-length files: {0}".\
-            format(', '.join(non_zero_length_files))
-        assert_false(non_zero_length_files, error_msg)
-
-        self.env.bootstrap_nodes(
-            self.env.d_env.nodes().slaves[:1])
-        cluster_id = self.fuel_web.create_cluster(
-            name=self.__class__.__name__,
-            mode=DEPLOYMENT_MODE)
-        logger.info('cluster is %s' % str(cluster_id))
-        self.fuel_web.update_nodes(
-            cluster_id,
-            {'slave-01': ['controller']}
-        )
-        self.fuel_web.deploy_cluster_wait(cluster_id)
-
-        zero_length_files = self.get_zero_length_files()
-        assert_false(
-            zero_length_files,
-            "Files {0} have 0 length".format(', '.join(zero_length_files)))
+        super(self.__class__, self).deploy_ha_one_controller_neutron_base(
+            snapshot_name="deploy_ha_one_controller_neutron_usb")

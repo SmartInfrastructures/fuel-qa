@@ -26,8 +26,7 @@ def check_hiera_resources(remote, file_name=None):
     assert_true('fine' in output, output)
     if not file_name:
         output_f = ''.join(remote.execute(
-            'if [ -r /etc/hiera.yaml ] ; then echo "passed" ;  fi')[
-            'stdout'])
+            'if [ -r /etc/hiera.yaml ] ; then echo "passed" ;  fi')['stdout'])
         assert_true('passed' in output_f, output_f)
     else:
         output_f = ''.join(remote.execute(
@@ -48,7 +47,7 @@ def check_interface_status(remote, iname):
     cmd = 'ethtools {0}| grep "Link detected"'.format(iname)
     result = remote.execute(cmd)
     assert_equal(0, result['exit_code'],
-                 "Non-zero exit code sderr {0}, "
+                 "Non-zero exit code stderr {0}, "
                  "stdout {1}".format(result['stderr'], result['stdout']))
 
     assert_true('yes' in ''.join(result['stdout']),
@@ -63,7 +62,7 @@ def ping_remote_net(remote, ip):
     assert_equal(
         res['exit_code'], 0,
         "Ping of {0} ended with non zero exit-code. "
-        "Stdout is {1}, sderr {2}".format(
+        "Stdout is {1}, stderr {2}".format(
             ip, ''.join(res['stdout']), ''.join(res['stderr'])))
 
 
@@ -80,7 +79,7 @@ def check_tools_task(remote, tool_name):
     assert_equal(
         0, output['exit_code'],
         "Command {0} failed with non zero exit code, current output is:"
-        " stdout {1}, sdterr: {2} ".format(
+        " stdout {1}, stderr: {2} ".format(
             cmd_sh, ''.join(output['stdout']), ''.join(output['stderr'])))
 
 
@@ -94,7 +93,7 @@ def run_check_from_task(remote, path):
                 path, res['stderr'], res['stdout']))
     except AssertionError:
         time.sleep(60)
-        logger.info('remoote is {0}'.format(remote))
+        logger.info('remote is {0}'.format(remote))
         res = remote.execute('{0}'.format(path))
         assert_equal(
             0, res['exit_code'],
