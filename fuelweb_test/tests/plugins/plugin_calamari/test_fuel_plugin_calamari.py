@@ -19,6 +19,7 @@ from proboscis import test
 from fuelweb_test import logger
 from fuelweb_test.helpers.decorators import log_snapshot_after_test
 from fuelweb_test.helpers import checkers
+from fuelweb_test.helpers import utils
 from fuelweb_test.settings import DEPLOYMENT_MODE
 from fuelweb_test.settings import CALAMARI_PLUGIN_PATH
 from fuelweb_test.tests.base_test_case import SetupEnvironment
@@ -50,18 +51,26 @@ class CalamariPlugin(TestBasic):
         Duration 35m TODO
         Snapshot deploy_ha_one_controller_neutron_calamari
         """
+        checkers.check_plugin_path_env(
+            var_name='CALAMARI_PLUGIN_PATH',
+            plugin_path=CALAMARI_PLUGIN_PATH
+        )
+        
         self.env.revert_snapshot("ready_with_5_slaves")
 
         # copy plugin to the master node
-
-        checkers.upload_tarball(
-            self.env.d_env.get_admin_remote(),
-            CALAMARI_PLUGIN_PATH, '/var')
+        checkers.check_archive_type(CALAMARI_PLUGIN_PATH)
+        
+        utils.upload_tarball(
+            ip=self.ssh_manager.admin_ip,
+            tar_path=CALAMARI_PLUGIN_PATH,
+            tar_target='/var'
+        )
 
         # install plugin
 
-        checkers.install_plugin_check_code(
-            self.env.d_env.get_admin_remote(),
+        utils.install_plugin_check_code(
+            ip=self.ssh_manager.admin_ip,
             plugin=os.path.basename(CALAMARI_PLUGIN_PATH))
 
         segment_type = 'vlan'
@@ -139,18 +148,28 @@ class CalamariPlugin(TestBasic):
         Snapshot deploy_nova_calamari_ha
 
         """
+        checkers.check_plugin_path_env(
+            var_name='CALAMARI_PLUGIN_PATH',
+            plugin_path=CALAMARI_PLUGIN_PATH
+        )
+                
         self.env.revert_snapshot("ready_with_5_slaves")
 
         # copy plugin to the master node
+        checkers.check_archive_type(CALAMARI_PLUGIN_PATH)
 
-        checkers.upload_tarball(
-            self.env.d_env.get_admin_remote(), CALAMARI_PLUGIN_PATH, '/var')
+        utils.upload_tarball(
+            ip=self.ssh_manager.admin_ip,
+            tar_path=CALAMARI_PLUGIN_PATH,
+            tar_target='/var'
+        )
 
         # install plugin
 
-        checkers.install_plugin_check_code(
-            self.env.d_env.get_admin_remote(),
+        utils.install_plugin_check_code(
+            ip=self.ssh_manager.admin_ip,
             plugin=os.path.basename(CALAMARI_PLUGIN_PATH))
+
 
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
@@ -227,17 +246,25 @@ class CalamariPlugin(TestBasic):
         Snapshot deploy_neutron_calamari_ha_add_node
 
         """
+        checkers.check_plugin_path_env(
+            var_name='CALAMARI_PLUGIN_PATH',
+            plugin_path=CALAMARI_PLUGIN_PATH
+        )
+        
         self.env.revert_snapshot("ready_with_5_slaves")
 
         # copy plugin to the master node
 
-        checkers.upload_tarball(
-            self.env.d_env.get_admin_remote(), CALAMARI_PLUGIN_PATH, '/var')
+        utils.upload_tarball(
+            ip=self.ssh_manager.admin_ip,
+            tar_path=CALAMARI_PLUGIN_PATH,
+            tar_target='/var'
+        )
 
         # install plugin
 
-        checkers.install_plugin_check_code(
-            self.env.d_env.get_admin_remote(),
+        utils.install_plugin_check_code(
+            ip=self.ssh_manager.admin_ip,
             plugin=os.path.basename(CALAMARI_PLUGIN_PATH))
 
         cluster_id = self.fuel_web.create_cluster(
@@ -248,6 +275,17 @@ class CalamariPlugin(TestBasic):
                 "net_segment_type": 'gre',
             }
         )
+
+        segment_type = 'vlan'
+        cluster_id = self.fuel_web.create_cluster(
+            name=self.__class__.__name__,
+            mode=DEPLOYMENT_MODE,
+            settings={
+                "net_provider": 'neutron',
+                "net_segment_type": segment_type,
+            }
+        )
+
 
         plugin_name = 'fuel_plugin_calamari'
         msg = "Plugin couldn't be enabled. Check plugin version. Test aborted"
