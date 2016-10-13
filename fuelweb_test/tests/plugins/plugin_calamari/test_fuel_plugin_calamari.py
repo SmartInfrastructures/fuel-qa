@@ -73,13 +73,14 @@ class CalamariPlugin(TestBasic):
             ip=self.ssh_manager.admin_ip,
             plugin=os.path.basename(CALAMARI_PLUGIN_PATH))
 
-        segment_type = 'vlan'
+        segment_type = NEUTRON_SEGMENT['vlan']
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
             mode=DEPLOYMENT_MODE,
             settings={
                 "net_provider": 'neutron',
                 "net_segment_type": segment_type,
+                "propagate_task_deploy": True
             }
         )
 
@@ -174,6 +175,7 @@ class CalamariPlugin(TestBasic):
         cluster_id = self.fuel_web.create_cluster(
             name=self.__class__.__name__,
             mode=DEPLOYMENT_MODE,
+            settings={"propagate_task_deploy": True}
         )
 
         plugin_name = 'fuel_plugin_calamari'
@@ -272,17 +274,8 @@ class CalamariPlugin(TestBasic):
             mode=DEPLOYMENT_MODE,
             settings={
                 "net_provider": 'neutron',
-                "net_segment_type": 'gre',
-            }
-        )
-
-        segment_type = 'vlan'
-        cluster_id = self.fuel_web.create_cluster(
-            name=self.__class__.__name__,
-            mode=DEPLOYMENT_MODE,
-            settings={
-                "net_provider": 'neutron',
-                "net_segment_type": segment_type,
+                "net_segment_type": NEUTRON_SEGMENT['tun'],
+                "propagate_task_deploy": True
             }
         )
 
@@ -306,7 +299,7 @@ class CalamariPlugin(TestBasic):
         self.fuel_web.deploy_cluster_wait(cluster_id)
         self.fuel_web.verify_network(cluster_id)
         
-        # ADD test here
+        # TODO: ADD test here
 
         # add verification here
         self.fuel_web.run_ostf(
